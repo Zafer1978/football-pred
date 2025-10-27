@@ -1,10 +1,6 @@
 // server.js
-// Minimal, Render-ready app that shows ONLY next-day predictions.
-// - No date picker, no CSV export.
-// - Keeps Subscribe form.
-// - Optional data sources: API-Football (if API_FOOTBALL_KEY set) and/or your own JSON feed (PREDICTIONS_FEED).
-// - Falls back to demo rows so UI always renders.
-// - Includes clear AdSense placeholders (paste your code when approved).
+// Next-day predictions only. No date/search/CSV. Subscribe + AdSense placeholders.
+// Real data via API_FOOTBALL_KEY or PREDICTIONS_FEED. Fallback to demo rows.
 
 import express from 'express';
 import fs from 'fs';
@@ -25,18 +21,19 @@ app.use(express.json());
 // ---- Utils ----
 function ymd(date, tz = TZ) {
   const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  return fmt.format(date);
+  return fmt.format(date); // YYYY-MM-DD
 }
 function nextDayYMD(tz = TZ) {
   const now = new Date();
   const tomorrow = new Date(now.getTime() + 24*60*60*1000);
-  return ymd(tomorrow, tz); // YYYY-MM-DD
+  return ymd(tomorrow, tz);
 }
 function toLocalISO(utcISOString, tz = TZ) {
   try {
     const dt = new Date(utcISOString);
     const parts = new Intl.DateTimeFormat('en-GB', {
-      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit'
     }).formatToParts(dt);
     const o = Object.fromEntries(parts.map(p => [p.type, p.value]));
     const [d,m,y] = [o.day,o.month,o.year];
@@ -48,48 +45,62 @@ function toLocalISO(utcISOString, tz = TZ) {
 async function sourceApiFootball(dateYMD) {
   const apiKey = process.env.API_FOOTBALL_KEY;
   if (!apiKey) return [];
-  const headers = { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'v3.football.api-sports.io' };
+
   const base = 'https://v3.football.api-sports.io';
-  try {
-    const fxRes = await fetch(`${base}/fixtures?date=${dateYMD}`, { headers });
-    const fxJson = await fxRes.json();
-    const fixtures = fxJson?.response || [];
-    const out = [];
-    for (const f of fixtures) {
-      const fixtureId = f.fixture?.id;
-      const league = `${f.league?.country || ''} ${f.league?.name || ''}`.trim();
-      const kickoff = toLocalISO(f.fixture?.date);
-      const home = f.teams?.home?.name || 'Home';
-      const away = f.teams?.away?.name || 'Away';
-      let prediction = 'N/A', confidence;
-      if (fixtureId) {
-        try {
-          const pRes = await fetch(`${base}/predictions?fixture=${fixtureId}`, { headers });
-          const pJson = await pRes.json();
-          const pred = pJson?.response?.[0];
-          if (pred?.predictions?.winner?.name) {
-            const w = pred.predictions.winner.name;
-            if (/home/i.test(w)) prediction = '1';
-            else if (/away/i.test(w)) prediction = '2';
-            else if (/draw/i.test(w)) prediction = 'X';
-            else prediction = w;
-          }
-          if (pred?.predictions?.percent) {
-            const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
-            const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
-            const max = Math.max(...nums);
-            confidence = `${max}%`;
-          }
-        } catch {}
+  // Try both header styles (direct API-Sports and RapidAPI):
+  const headersList = [
+    { 'x-apisports-key': apiKey },
+    { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'v3.football.api-sports.io' }
+  ];
+
+  for (const headers of headersList) {
+    try {
+      const fxRes = await fetch(`${base}/fixtures?date=${dateYMD}`, { headers });
+      if (!fxRes.ok) continue;
+      const fxJson = await fxRes.json();
+      const fixtures = fxJson?.response || [];
+
+      const out = [];
+      for (const f of fixtures) {
+        const fixtureId = f.fixture?.id;
+        const league = `${f.league?.country || ''} ${f.league?.name || ''}`.trim();
+        const kickoff = toLocalISO(f.fixture?.date);
+        const home = f.teams?.home?.name || 'Home';
+        const away = f.teams?.away?.name || 'Away';
+
+        let prediction = 'N/A', confidence;
+        if (fixtureId) {
+          try {
+            const pRes = await fetch(`${base}/predictions?fixture=${fixtureId}`, { headers });
+            if (pRes.ok) {
+              const pJson = await pRes.json();
+              const pred = pJson?.response?.[0];
+              if (pred?.predictions?.winner?.name) {
+                const w = pred.predictions.winner.name;
+                if (/home/i.test(w)) prediction = '1';
+                else if (/away/i.test(w)) prediction = '2';
+                else if (/draw/i.test(w)) prediction = 'X';
+                else prediction = w;
+              }
+              if (pred?.predictions?.percent) {
+                const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
+                const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
+                const max = Math.max(...nums);
+                confidence = `${max}%`;
+              }
+            }
+          } catch {}
+        }
+        out.push({ league, kickoff, home, away, prediction, confidence, source: 'API-Football' });
       }
-      out.push({ league, kickoff, home, away, prediction, confidence, source: 'API-Football' });
-    }
-    return out;
-  } catch { return []; }
+      return out;
+    } catch {}
+  }
+  return [];
 }
 
 async function sourceCustomJson(dateYMD) {
-  const url = process.env.PREDICTIONS_FEED; // e.g., https://yourdomain.com/predictions/YYYY-MM-DD.json
+  const url = process.env.PREDICTIONS_FEED; // e.g. https://yourdomain.com/predictions/YYYY-MM-DD.json
   if (!url) return [];
   try {
     const res = await fetch(url.replace('YYYY-MM-DD', dateYMD));
@@ -130,17 +141,17 @@ app.get('/api/nextday', async (_req, res) => {
   res.json(data);
 });
 
-// ---- Frontend ----
+// ---- Frontend (no date/search/CSV) ----
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tomorrow’s Football Predictions</title>
+  <title>Predictions for <span id="dateLabel">tomorrow</span></title>
   <meta name="description" content="Broadcast of next-day football match predictions." />
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- Google AdSense (paste your real code when approved) -->
+  <!-- Google AdSense (paste real code when approved) -->
   <!--
   <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=YOUR-ADSENSE-CLIENT" crossorigin="anonymous"></script>
   -->
@@ -150,24 +161,20 @@ const INDEX_HTML = `<!doctype html>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-7xl mx-auto p-4">
 
-    <!-- Top bar -->
     <header class="mb-6 flex items-center justify-between">
       <div>
-        <h1 class="text-3xl font-extrabold tracking-tight">Tomorrow’s Football Predictions</h1>
-        <p class="text-sm text-slate-600">Automatically shows next-day picks. Informational only.</p>
+        <h1 class="text-3xl font-extrabold tracking-tight">Predictions for <span id="dateLabel2">tomorrow</span></h1>
+        <p class="text-sm text-slate-600">Informational only.</p>
       </div>
       <a href="#subscribe" class="rounded-xl px-3 py-2 text-sm border hover:bg-slate-100">Subscribe</a>
     </header>
 
-    <!-- Top ad slot (responsive) -->
+    <!-- Top ad slot -->
     <div class="mb-4 bg-white rounded-2xl shadow p-4 min-h-24 flex items-center justify-center text-slate-500">
-      <!-- Google AdSense: paste your <ins class="adsbygoogle"> block here -->
-      <!-- <ins class="adsbygoogle" style="display:block" data-ad-client="YOUR-ADSENSE-CLIENT" data-ad-slot="YOUR-SLOT" data-ad-format="auto" data-full-width-responsive="true"></ins>
-      <script>(adsbygoogle = window.adsbygoogle || []).push({});</script> -->
+      <!-- AdSense: paste your <ins class="adsbygoogle"> block here with push() -->
       <span class="text-xs uppercase tracking-wide">Ad Space (Responsive)</span>
     </div>
 
-    <!-- Table -->
     <div class="overflow-x-auto bg-white rounded-2xl shadow">
       <table class="min-w-full text-sm" id="tbl">
         <thead class="bg-slate-100 sticky"><tr>
@@ -184,11 +191,10 @@ const INDEX_HTML = `<!doctype html>
 
     <!-- Inline ad slot -->
     <div class="mt-4 bg-white rounded-2xl shadow p-4 min-h-24 flex items-center justify-center text-slate-500">
-      <!-- Google AdSense block goes here -->
+      <!-- AdSense block can go here -->
       <span class="text-xs uppercase tracking-wide">Ad Space</span>
     </div>
 
-    <!-- Subscribe -->
     <section id="subscribe" class="mt-6 bg-sky-600 text-white rounded-2xl shadow p-6">
       <h2 class="text-xl font-semibold mb-2">Get daily predictions by email</h2>
       <form id="subForm" class="flex flex-col sm:flex-row gap-3" method="post" action="/subscribe">
@@ -211,6 +217,14 @@ const INDEX_HTML = `<!doctype html>
       const res = await fetch('/api/nextday');
       const data = await res.json();
       const rows = data.rows || [];
+
+      // set headings to real YYYY-MM-DD
+      const d = data.date || 'tomorrow';
+      const d1 = document.getElementById('dateLabel');
+      const d2 = document.getElementById('dateLabel2');
+      if (d1) d1.textContent = d;
+      if (d2) d2.textContent = d;
+
       rowsEl.innerHTML = rows.map(r => \`
         <tr class="border-b last:border-0">
           <td class="p-3 whitespace-nowrap">\${r.kickoff||''}</td>
@@ -223,6 +237,8 @@ const INDEX_HTML = `<!doctype html>
       ).join('');
     }
     load();
+    // optional 5-minute refresh:
+    setInterval(load, 5 * 60 * 1000);
 
     subForm.addEventListener('submit', async (e) => {
       e.preventDefault();
