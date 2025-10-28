@@ -1,11 +1,15 @@
 // server.js
-// Next-day predictions only. No date/search/CSV. Subscribe + AdSense placeholders.
-// Real data via API_FOOTBALL_KEY or PREDICTIONS_FEED. Fallback to demo rows.
+// TODAY'S predictions (Europe/Istanbul). Auto-refresh cache every day at 00:01.
+// - Real data via API_FOOTBALL_KEY and/or PREDICTIONS_FEED
+// - Fallback to a clean demo so UI always renders
+// - Subscribe form saves to DATA_DIR/subscribers.csv
+// - AdSense placeholders included (paste real code when approved)
 
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
+import cron from 'node-cron';
 
 dotenv.config();
 
@@ -18,15 +22,10 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ---- Utils ----
-function ymd(date, tz = TZ) {
+// ---- Helpers ----
+function todayYMD(tz = TZ) {
   const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  return fmt.format(date); // YYYY-MM-DD
-}
-function nextDayYMD(tz = TZ) {
-  const now = new Date();
-  const tomorrow = new Date(now.getTime() + 24*60*60*1000);
-  return ymd(tomorrow, tz);
+  return fmt.format(new Date()); // YYYY-MM-DD
 }
 function toLocalISO(utcISOString, tz = TZ) {
   try {
@@ -40,14 +39,23 @@ function toLocalISO(utcISOString, tz = TZ) {
     return `${y}-${m}-${d} ${o.hour}:${o.minute}`;
   } catch { return utcISOString; }
 }
+function cacheFile(dateYMD) { return path.join(DATA_DIR, `predictions-${dateYMD}.json`); }
+function loadCache(dateYMD) {
+  const f = cacheFile(dateYMD);
+  if (fs.existsSync(f)) try { return JSON.parse(fs.readFileSync(f, 'utf-8')); } catch {}
+  return null;
+}
+function saveCache(dateYMD, rows) {
+  const f = cacheFile(dateYMD);
+  fs.writeFileSync(f, JSON.stringify({ date: dateYMD, rows, savedAt: new Date().toISOString() }, null, 2));
+}
 
-// ---- Sources (optional) ----
+// ---- Sources ----
 async function sourceApiFootball(dateYMD) {
   const apiKey = process.env.API_FOOTBALL_KEY;
   if (!apiKey) return [];
 
   const base = 'https://v3.football.api-sports.io';
-  // Try both header styles (direct API-Sports and RapidAPI):
   const headersList = [
     { 'x-apisports-key': apiKey },
     { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'v3.football.api-sports.io' }
@@ -100,7 +108,7 @@ async function sourceApiFootball(dateYMD) {
 }
 
 async function sourceCustomJson(dateYMD) {
-  const url = process.env.PREDICTIONS_FEED; // e.g. https://yourdomain.com/predictions/YYYY-MM-DD.json
+  const url = process.env.PREDICTIONS_FEED; // e.g., https://yourdomain.com/predictions/YYYY-MM-DD.json
   if (!url) return [];
   try {
     const res = await fetch(url.replace('YYYY-MM-DD', dateYMD));
@@ -119,36 +127,59 @@ async function sourceCustomJson(dateYMD) {
 }
 
 async function sourceDemo(dateYMD) {
+  // nicer demo like your first version
   return [
-    { league: 'Demo League', kickoff: `${dateYMD} 19:00`, home: 'Alpha FC', away: 'Beta United', prediction: '1', confidence: '58%', source: 'Demo' },
-    { league: 'Demo League', kickoff: `${dateYMD} 21:30`, home: 'Gamma City', away: 'Delta Town', prediction: 'X', confidence: '41%', source: 'Demo' }
+    { league: 'Premier League', kickoff: `${dateYMD} 17:00`, home: 'Arsenal',   away: 'Chelsea',   prediction: '1', confidence: '68%', source: 'Demo' },
+    { league: 'La Liga',        kickoff: `${dateYMD} 19:30`, home: 'Barcelona', away: 'Sevilla',   prediction: '1', confidence: '74%', source: 'Demo' },
+    { league: 'Serie A',        kickoff: `${dateYMD} 21:45`, home: 'Inter',     away: 'Juventus',  prediction: 'X', confidence: '45%', source: 'Demo' }
   ];
 }
 
-async function getNextDayPredictions() {
-  const d = nextDayYMD();
-  const fromApi = await sourceApiFootball(d);
-  const fromFeed = await sourceCustomJson(d);
-  let rows = [...fromApi, ...fromFeed];
-  if (!rows.length) rows = await sourceDemo(d);
-  rows.sort((a,b) => (a.kickoff||'').localeCompare(b.kickoff||'') || (a.league||'').localeCompare(b.league||'') || (a.home||'').localeCompare(b.home||''));
-  return { date: d, rows };
+async function collectToday(dateYMD) {
+  const a = await sourceApiFootball(dateYMD);
+  const b = await sourceCustomJson(dateYMD);
+  let rows = [...a, ...b];
+  if (!rows.length) rows = await sourceDemo(dateYMD);
+  rows.sort((x,y) => (x.kickoff||'').localeCompare(y.kickoff||'') || (x.league||'').localeCompare(y.league||'') || (x.home||'').localeCompare(y.home||''));
+  return rows;
 }
 
+// ---- Warm cache on boot and at 00:01 daily ----
+async function warm(dateYMD) {
+  const rows = await collectToday(dateYMD);
+  saveCache(dateYMD, rows);
+  console.log(`[warm] cached ${rows.length} rows for ${dateYMD}`);
+  return rows;
+}
+(async () => {
+  const d = todayYMD();
+  await warm(d);
+})();
+
+cron.schedule('1 0 * * *', async () => {
+  const d = todayYMD();
+  await warm(d);
+}, { timezone: TZ });
+
 // ---- API ----
-app.get('/api/nextday', async (_req, res) => {
-  const data = await getNextDayPredictions();
-  res.json(data);
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+app.get('/api/today', async (_req, res) => {
+  const d = todayYMD();
+  const cached = loadCache(d);
+  if (cached?.rows?.length) return res.json(cached);
+  const rows = await warm(d);
+  res.json({ date: d, rows, savedAt: new Date().toISOString() });
 });
 
-// ---- Frontend (no date/search/CSV) ----
+// ---- Frontend ----
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Predictions for <span id="dateLabel">tomorrow</span></title>
-  <meta name="description" content="Broadcast of next-day football match predictions." />
+  <title>Today’s Football Predictions</title>
+  <meta name="description" content="Broadcast of daily football match predictions." />
   <script src="https://cdn.tailwindcss.com"></script>
 
   <!-- Google AdSense (paste real code when approved) -->
@@ -163,8 +194,8 @@ const INDEX_HTML = `<!doctype html>
 
     <header class="mb-6 flex items-center justify-between">
       <div>
-        <h1 class="text-3xl font-extrabold tracking-tight">Predictions for <span id="dateLabel2">tomorrow</span></h1>
-        <p class="text-sm text-slate-600">Informational only.</p>
+        <h1 class="text-3xl font-extrabold tracking-tight">Predictions for <span id="dateLabel">—</span></h1>
+        <p class="text-sm text-slate-600">Auto-updates daily at 00:01 (Istanbul time). Informational only.</p>
       </div>
       <a href="#subscribe" class="rounded-xl px-3 py-2 text-sm border hover:bg-slate-100">Subscribe</a>
     </header>
@@ -212,18 +243,13 @@ const INDEX_HTML = `<!doctype html>
     const rowsEl = document.getElementById('rows');
     const subForm = document.getElementById('subForm');
     const subMsg = document.getElementById('subMsg');
+    const dateLabel = document.getElementById('dateLabel');
 
     async function load() {
-      const res = await fetch('/api/nextday');
+      const res = await fetch('/api/today');
       const data = await res.json();
       const rows = data.rows || [];
-
-      // set headings to real YYYY-MM-DD
-      const d = data.date || 'tomorrow';
-      const d1 = document.getElementById('dateLabel');
-      const d2 = document.getElementById('dateLabel2');
-      if (d1) d1.textContent = d;
-      if (d2) d2.textContent = d;
+      if (dateLabel && data.date) dateLabel.textContent = data.date;
 
       rowsEl.innerHTML = rows.map(r => \`
         <tr class="border-b last:border-0">
@@ -237,8 +263,8 @@ const INDEX_HTML = `<!doctype html>
       ).join('');
     }
     load();
-    // optional 5-minute refresh:
-    setInterval(load, 5 * 60 * 1000);
+    // refresh every 10 minutes in case feed updates mid-day
+    setInterval(load, 10 * 60 * 1000);
 
     subForm.addEventListener('submit', async (e) => {
       e.preventDefault();
