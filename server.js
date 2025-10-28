@@ -1,9 +1,10 @@
 // server.js
-// TODAY'S predictions (Europe/Istanbul). Auto-refresh cache every day at 00:01.
-// - Real data via API_FOOTBALL_KEY and/or PREDICTIONS_FEED
-// - Fallback to a clean demo so UI always renders
-// - Subscribe form saves to DATA_DIR/subscribers.csv
-// - AdSense placeholders included (paste real code when approved)
+// TODAY (Europe/Istanbul) real-time from API-Football, no manual upload needed.
+// - Uses /fixtures?date=YYYY-MM-DD&timezone=Europe/Istanbul to get today's games
+// - Tries /predictions per fixture (if your plan includes it).
+// - If predictions unavailable, still shows REAL fixtures with prediction = "—" (no demo).
+// - Auto-refreshes cache at 00:01 (Istanbul) so it rolls to the new day automatically.
+// - Subscribe form + AdSense placeholders preserved.
 
 import express from 'express';
 import fs from 'fs';
@@ -50,12 +51,19 @@ function saveCache(dateYMD, rows) {
   fs.writeFileSync(f, JSON.stringify({ date: dateYMD, rows, savedAt: new Date().toISOString() }, null, 2));
 }
 
-// ---- Sources ----
-async function sourceApiFootball(dateYMD) {
+// ---- API-Football source ----
+async function fetchJson(url, headers) {
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function sourceApiFootballToday(dateYMD) {
   const apiKey = process.env.API_FOOTBALL_KEY;
-  if (!apiKey) return [];
+  if (!apiKey) return { rows: [], reason: 'no_api_key' };
 
   const base = 'https://v3.football.api-sports.io';
+  // Support both header styles (APISports direct & RapidAPI)
   const headersList = [
     { 'x-apisports-key': apiKey },
     { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'v3.football.api-sports.io' }
@@ -63,10 +71,11 @@ async function sourceApiFootball(dateYMD) {
 
   for (const headers of headersList) {
     try {
-      const fxRes = await fetch(`${base}/fixtures?date=${dateYMD}`, { headers });
-      if (!fxRes.ok) continue;
-      const fxJson = await fxRes.json();
+      // IMPORTANT: pass timezone to fixtures so the date aligns to Istanbul
+      const fxUrl = `${base}/fixtures?date=${dateYMD}&timezone=${encodeURIComponent(TZ)}`;
+      const fxJson = await fetchJson(fxUrl, headers);
       const fixtures = fxJson?.response || [];
+      if (!fixtures.length) continue;
 
       const out = [];
       for (const f of fixtures) {
@@ -76,70 +85,54 @@ async function sourceApiFootball(dateYMD) {
         const home = f.teams?.home?.name || 'Home';
         const away = f.teams?.away?.name || 'Away';
 
-        let prediction = 'N/A', confidence;
+        // Default (in case predictions endpoint not in plan): show fixture without pick
+        let prediction = '—';
+        let confidence = '';
+
         if (fixtureId) {
           try {
-            const pRes = await fetch(`${base}/predictions?fixture=${fixtureId}`, { headers });
-            if (pRes.ok) {
-              const pJson = await pRes.json();
-              const pred = pJson?.response?.[0];
-              if (pred?.predictions?.winner?.name) {
-                const w = pred.predictions.winner.name;
-                if (/home/i.test(w)) prediction = '1';
-                else if (/away/i.test(w)) prediction = '2';
-                else if (/draw/i.test(w)) prediction = 'X';
-                else prediction = w;
-              }
-              if (pred?.predictions?.percent) {
-                const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
-                const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
-                const max = Math.max(...nums);
-                confidence = `${max}%`;
-              }
+            const pUrl = `${base}/predictions?fixture=${fixtureId}`;
+            const pJson = await fetchJson(pUrl, headers);
+            const pred = pJson?.response?.[0];
+            if (pred?.predictions?.winner?.name) {
+              const w = pred.predictions.winner.name;
+              if (/home/i.test(w)) prediction = '1';
+              else if (/away/i.test(w)) prediction = '2';
+              else if (/draw/i.test(w)) prediction = 'X';
+              else prediction = w;
             }
-          } catch {}
+            if (pred?.predictions?.percent) {
+              const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
+              const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
+              const max = Math.max(...nums);
+              confidence = `${max}%`;
+            }
+          } catch (e) {
+            // If predictions is not available on your plan, we simply leave "—"
+          }
         }
+
         out.push({ league, kickoff, home, away, prediction, confidence, source: 'API-Football' });
       }
-      return out;
-    } catch {}
+      return { rows: out, reason: 'ok' };
+    } catch (e) {
+      // Try next header style
+    }
   }
-  return [];
+  return { rows: [], reason: 'api_error_or_no_plan' };
 }
 
-async function sourceCustomJson(dateYMD) {
-  const url = process.env.PREDICTIONS_FEED; // e.g., https://yourdomain.com/predictions/YYYY-MM-DD.json
-  if (!url) return [];
-  try {
-    const res = await fetch(url.replace('YYYY-MM-DD', dateYMD));
-    if (!res.ok) throw new Error('feed not ok');
-    const arr = await res.json();
-    return (Array.isArray(arr) ? arr : []).map(x => ({
-      league: x.league || '',
-      kickoff: x.kickoff || '',
-      home: x.home || '',
-      away: x.away || '',
-      prediction: x.prediction || 'N/A',
-      confidence: x.confidence || undefined,
-      source: x.source || 'Custom feed'
-    }));
-  } catch { return []; }
-}
-
-async function sourceDemo(dateYMD) {
-  // nicer demo like your first version
-  return [
-    { league: 'Premier League', kickoff: `${dateYMD} 17:00`, home: 'Arsenal',   away: 'Chelsea',   prediction: '1', confidence: '68%', source: 'Demo' },
-    { league: 'La Liga',        kickoff: `${dateYMD} 19:30`, home: 'Barcelona', away: 'Sevilla',   prediction: '1', confidence: '74%', source: 'Demo' },
-    { league: 'Serie A',        kickoff: `${dateYMD} 21:45`, home: 'Inter',     away: 'Juventus',  prediction: 'X', confidence: '45%', source: 'Demo' }
-  ];
-}
-
+// ---- Collection (no demo unless there is absolutely nothing) ----
 async function collectToday(dateYMD) {
-  const a = await sourceApiFootball(dateYMD);
-  const b = await sourceCustomJson(dateYMD);
-  let rows = [...a, ...b];
-  if (!rows.length) rows = await sourceDemo(dateYMD);
+  const api = await sourceApiFootballToday(dateYMD);
+  let rows = api.rows;
+
+  // Only if we truly have nothing, keep a tiny neutral placeholder (or leave blank)
+  if (!rows.length) {
+    // Return empty to avoid confusing "yesterday-like" demos
+    rows = [];
+  }
+
   rows.sort((x,y) => (x.kickoff||'').localeCompare(y.kickoff||'') || (x.league||'').localeCompare(y.league||'') || (x.home||'').localeCompare(y.home||''));
   return rows;
 }
@@ -167,7 +160,7 @@ app.get('/healthz', (_req, res) => res.json({ ok: true }));
 app.get('/api/today', async (_req, res) => {
   const d = todayYMD();
   const cached = loadCache(d);
-  if (cached?.rows?.length) return res.json(cached);
+  if (cached) return res.json(cached);
   const rows = await warm(d);
   res.json({ date: d, rows, savedAt: new Date().toISOString() });
 });
@@ -263,7 +256,7 @@ const INDEX_HTML = `<!doctype html>
       ).join('');
     }
     load();
-    // refresh every 10 minutes in case feed updates mid-day
+    // Refresh every 10 minutes in case API updates within the day
     setInterval(load, 10 * 60 * 1000);
 
     subForm.addEventListener('submit', async (e) => {
