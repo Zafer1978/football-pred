@@ -1,10 +1,18 @@
-// server.js
-// TODAY (Europe/Istanbul) real-time from API-Football, no manual upload needed.
-// - Uses /fixtures?date=YYYY-MM-DD&timezone=Europe/Istanbul to get today's games
-// - Tries /predictions per fixture (if your plan includes it).
-// - If predictions unavailable, still shows REAL fixtures with prediction = "—" (no demo).
-// - Auto-refreshes cache at 00:01 (Istanbul) so it rolls to the new day automatically.
-// - Subscribe form + AdSense placeholders preserved.
+// server.js — Today (TRT) with rate‑limited predictions & robust retries
+// - Fetches TODAY's fixtures with timezone=Europe/Istanbul
+// - Calls /predictions per fixture with a gentle rate limit to avoid quota/minute caps
+// - If predictions are unavailable / rate-limited, shows fixtures with prediction="—"
+// - Caches the full day; warms at 00:01 (Istanbul)
+// - Subscribe + AdSense placeholders kept
+//
+// Tuning via env:
+//   API_FOOTBALL_KEY=... (required for live data)
+//   TZ=Europe/Istanbul
+//   PREDICTION_CONCURRENCY=1         (how many prediction requests in parallel)
+//   PREDICTION_DELAY_MS=1200         (delay between prediction requests)
+//   PREDICTION_MAX=80                (hard cap to protect daily quota)
+//   RETRY_429_DELAY_MS=5000          (backoff on 429)
+//   DATA_DIR=/data                   (if using a Render disk)
 
 import express from 'express';
 import fs from 'fs';
@@ -19,6 +27,12 @@ const PORT = process.env.PORT || 3000;
 const TZ = process.env.TZ || 'Europe/Istanbul';
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// rate limit knobs
+const PREDICTION_CONCURRENCY = parseInt(process.env.PREDICTION_CONCURRENCY || '1', 10);
+const PREDICTION_DELAY_MS    = parseInt(process.env.PREDICTION_DELAY_MS || '1200', 10);
+const PREDICTION_MAX         = parseInt(process.env.PREDICTION_MAX || '80', 10);
+const RETRY_429_DELAY_MS     = parseInt(process.env.RETRY_429_DELAY_MS || '5000', 10);
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -51,99 +65,165 @@ function saveCache(dateYMD, rows) {
   fs.writeFileSync(f, JSON.stringify({ date: dateYMD, rows, savedAt: new Date().toISOString() }, null, 2));
 }
 
-// ---- API-Football source ----
-async function fetchJson(url, headers) {
+// ---- HTTP helper with friendly logging/retry ----
+async function fetchText(url, headers) {
   const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  const text = await res.text();
+  if (!res.ok) {
+    console.warn('[api] HTTP', res.status, res.statusText, 'for', url, 'body head:', text.slice(0, 200));
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+  return text;
+}
+async function fetchJson(url, headers) {
+  const t = await fetchText(url, headers);
+  try { return JSON.parse(t); }
+  catch (e) {
+    console.error('[api] JSON parse err for', url, 'body head:', t.slice(0, 200));
+    throw e;
+  }
 }
 
+// ---- API-Football source (fixtures + rate‑limited predictions) ----
 async function sourceApiFootballToday(dateYMD) {
   const apiKey = process.env.API_FOOTBALL_KEY;
   if (!apiKey) return { rows: [], reason: 'no_api_key' };
 
   const base = 'https://v3.football.api-sports.io';
-  // Support both header styles (APISports direct & RapidAPI)
   const headersList = [
     { 'x-apisports-key': apiKey },
     { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'v3.football.api-sports.io' }
   ];
 
+  console.log('[api] date:', dateYMD, 'tz:', TZ);
+
   for (const headers of headersList) {
     try {
-      // IMPORTANT: pass timezone to fixtures so the date aligns to Istanbul
       const fxUrl = `${base}/fixtures?date=${dateYMD}&timezone=${encodeURIComponent(TZ)}`;
+      console.log('[api] fixtures url:', fxUrl);
       const fxJson = await fetchJson(fxUrl, headers);
       const fixtures = fxJson?.response || [];
+      console.log('[api] fixtures count:', fixtures.length);
       if (!fixtures.length) continue;
 
-      const out = [];
-      for (const f of fixtures) {
-        const fixtureId = f.fixture?.id;
-        const league = `${f.league?.country || ''} ${f.league?.name || ''}`.trim();
-        const kickoff = toLocalISO(f.fixture?.date);
-        const home = f.teams?.home?.name || 'Home';
-        const away = f.teams?.away?.name || 'Away';
+      // Build base rows first (no predictions yet)
+      const rows = fixtures.map(f => ({
+        fixtureId: f.fixture?.id,
+        league: `${f.league?.country || ''} ${f.league?.name || ''}`.trim(),
+        kickoff: toLocalISO(f.fixture?.date),
+        home: f.teams?.home?.name || 'Home',
+        away: f.teams?.away?.name || 'Away',
+        prediction: '—',
+        confidence: ''
+      }));
 
-        // Default (in case predictions endpoint not in plan): show fixture without pick
-        let prediction = '—';
-        let confidence = '';
+      // Prepare a prediction queue with rate limiting
+      let done = 0, inFlight = 0, idx = 0, used = 0;
+      const total = rows.length;
+      const next = () => rows[idx++];
 
-        if (fixtureId) {
-          try {
-            const pUrl = `${base}/predictions?fixture=${fixtureId}`;
-            const pJson = await fetchJson(pUrl, headers);
-            const pred = pJson?.response?.[0];
-            if (pred?.predictions?.winner?.name) {
-              const w = pred.predictions.winner.name;
-              if (/home/i.test(w)) prediction = '1';
-              else if (/away/i.test(w)) prediction = '2';
-              else if (/draw/i.test(w)) prediction = 'X';
-              else prediction = w;
-            }
-            if (pred?.predictions?.percent) {
-              const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
-              const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
-              const max = Math.max(...nums);
-              confidence = `${max}%`;
-            }
-          } catch (e) {
-            // If predictions is not available on your plan, we simply leave "—"
+      async function runOne(r) {
+        if (!r || !r.fixtureId) return;
+        if (used >= PREDICTION_MAX) return; // protect quota
+        used += 1;
+
+        const pUrl = `${base}/predictions?fixture=${r.fixtureId}`;
+        try {
+          const pJson = await fetchJson(pUrl, headers);
+          const pred = pJson?.response?.[0];
+          if (pred?.predictions?.winner?.name) {
+            const w = pred.predictions.winner.name;
+            if (/home/i.test(w)) r.prediction = '1';
+            else if (/away/i.test(w)) r.prediction = '2';
+            else if (/draw/i.test(w)) r.prediction = 'X';
+            else r.prediction = w;
           }
+          if (pred?.predictions?.percent) {
+            const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
+            const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
+            const max = Math.max(...nums);
+            r.confidence = `${max}%`;
+          }
+        } catch (e) {
+          if (e.status === 429) {
+            console.warn('[api] 429 rate-limited; backing off', RETRY_429_DELAY_MS, 'ms');
+            await new Promise(r => setTimeout(r, RETRY_429_DELAY_MS));
+            // try once more
+            try {
+              const pJson = await fetchJson(pUrl, headers);
+              const pred = pJson?.response?.[0];
+              if (pred?.predictions?.winner?.name) {
+                const w = pred.predictions.winner.name;
+                if (/home/i.test(w)) r.prediction = '1';
+                else if (/away/i.test(w)) r.prediction = '2';
+                else if (/draw/i.test(w)) r.prediction = 'X';
+                else r.prediction = w;
+              }
+              if (pred?.predictions?.percent) {
+                const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
+                const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
+                const max = Math.max(...nums);
+                r.confidence = `${max}%`;
+              }
+            } catch (e2) {
+              console.warn('[api] predictions still unavailable after backoff:', e2.message);
+            }
+          } else {
+            console.warn('[api] predictions skipped for fixture', r.fixtureId, '-', e.message);
+          }
+        } finally {
+          done += 1;
         }
-
-        out.push({ league, kickoff, home, away, prediction, confidence, source: 'API-Football' });
       }
-      return { rows: out, reason: 'ok' };
+
+      async function scheduler() {
+        return new Promise(resolve => {
+          const tick = async () => {
+            // launch up to concurrency
+            while (inFlight < PREDICTION_CONCURRENCY) {
+              const r = next();
+              if (!r) break;
+              inFlight += 1;
+              runOne(r).finally(() => { inFlight -= 1; });
+              await new Promise(r => setTimeout(r, PREDICTION_DELAY_MS));
+            }
+            if (done >= Math.min(total, PREDICTION_MAX)) return resolve();
+            setTimeout(tick, 250);
+          };
+          tick();
+        });
+      }
+
+      await scheduler();
+      console.log('[api] predictions attempted:', Math.min(total, PREDICTION_MAX));
+
+      // Return without fixtureId in final payload
+      return { rows: rows.map(({fixtureId, ...rest}) => rest), reason: 'ok' };
     } catch (e) {
-      // Try next header style
+      console.warn('[api] header mode failed - trying next:', e.message);
     }
   }
   return { rows: [], reason: 'api_error_or_no_plan' };
 }
 
-// ---- Collection (no demo unless there is absolutely nothing) ----
+// ---- Collect + cache ----
 async function collectToday(dateYMD) {
   const api = await sourceApiFootballToday(dateYMD);
   let rows = api.rows;
-
-  // Only if we truly have nothing, keep a tiny neutral placeholder (or leave blank)
-  if (!rows.length) {
-    // Return empty to avoid confusing "yesterday-like" demos
-    rows = [];
-  }
-
   rows.sort((x,y) => (x.kickoff||'').localeCompare(y.kickoff||'') || (x.league||'').localeCompare(y.league||'') || (x.home||'').localeCompare(y.home||''));
   return rows;
 }
 
-// ---- Warm cache on boot and at 00:01 daily ----
 async function warm(dateYMD) {
   const rows = await collectToday(dateYMD);
   saveCache(dateYMD, rows);
   console.log(`[warm] cached ${rows.length} rows for ${dateYMD}`);
   return rows;
 }
+
 (async () => {
   const d = todayYMD();
   await warm(d);
@@ -154,7 +234,7 @@ cron.schedule('1 0 * * *', async () => {
   await warm(d);
 }, { timezone: TZ });
 
-// ---- API ----
+// ---- Routes ----
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 app.get('/api/today', async (_req, res) => {
@@ -174,17 +254,14 @@ const INDEX_HTML = `<!doctype html>
   <title>Today’s Football Predictions</title>
   <meta name="description" content="Broadcast of daily football match predictions." />
   <script src="https://cdn.tailwindcss.com"></script>
-
-  <!-- Google AdSense (paste real code when approved) -->
+  <!-- AdSense placeholder (paste your real code when approved) -->
   <!--
   <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=YOUR-ADSENSE-CLIENT" crossorigin="anonymous"></script>
   -->
-
   <style> thead.sticky th{ position: sticky; top:0; z-index: 10; box-shadow: 0 1px 0 rgba(0,0,0,.05); } </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-7xl mx-auto p-4">
-
     <header class="mb-6 flex items-center justify-between">
       <div>
         <h1 class="text-3xl font-extrabold tracking-tight">Predictions for <span id="dateLabel">—</span></h1>
@@ -192,12 +269,6 @@ const INDEX_HTML = `<!doctype html>
       </div>
       <a href="#subscribe" class="rounded-xl px-3 py-2 text-sm border hover:bg-slate-100">Subscribe</a>
     </header>
-
-    <!-- Top ad slot -->
-    <div class="mb-4 bg-white rounded-2xl shadow p-4 min-h-24 flex items-center justify-center text-slate-500">
-      <!-- AdSense: paste your <ins class="adsbygoogle"> block here with push() -->
-      <span class="text-xs uppercase tracking-wide">Ad Space (Responsive)</span>
-    </div>
 
     <div class="overflow-x-auto bg-white rounded-2xl shadow">
       <table class="min-w-full text-sm" id="tbl">
@@ -211,12 +282,6 @@ const INDEX_HTML = `<!doctype html>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
-    </div>
-
-    <!-- Inline ad slot -->
-    <div class="mt-4 bg-white rounded-2xl shadow p-4 min-h-24 flex items-center justify-center text-slate-500">
-      <!-- AdSense block can go here -->
-      <span class="text-xs uppercase tracking-wide">Ad Space</span>
     </div>
 
     <section id="subscribe" class="mt-6 bg-sky-600 text-white rounded-2xl shadow p-6">
@@ -256,7 +321,6 @@ const INDEX_HTML = `<!doctype html>
       ).join('');
     }
     load();
-    // Refresh every 10 minutes in case API updates within the day
     setInterval(load, 10 * 60 * 1000);
 
     subForm.addEventListener('submit', async (e) => {
@@ -268,7 +332,7 @@ const INDEX_HTML = `<!doctype html>
     });
   </script>
 </body>
-</html>`;
+</html>`);
 
 // ---- Routes ----
 app.get('/', (_req, res) => {
