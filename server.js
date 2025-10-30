@@ -1,4 +1,11 @@
-// server.js — fixed HTML title apostrophe issue
+// server.js
+// TODAY (Europe/Istanbul) real-time from API-Football, no manual upload needed.
+// - Uses /fixtures?date=YYYY-MM-DD&timezone=Europe/Istanbul to get today's games
+// - Tries /predictions per fixture (if your plan includes it).
+// - If predictions unavailable, still shows REAL fixtures with prediction = "—" (no demo).
+// - Auto-refreshes cache at 00:01 (Istanbul) so it rolls to the new day automatically.
+// - Subscribe form + AdSense placeholders preserved.
+
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -16,44 +23,273 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// ---- Helpers ----
 function todayYMD(tz = TZ) {
   const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  return fmt.format(new Date());
+  return fmt.format(new Date()); // YYYY-MM-DD
+}
+function toLocalISO(utcISOString, tz = TZ) {
+  try {
+    const dt = new Date(utcISOString);
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit'
+    }).formatToParts(dt);
+    const o = Object.fromEntries(parts.map(p => [p.type, p.value]));
+    const [d,m,y] = [o.day,o.month,o.year];
+    return `${y}-${m}-${d} ${o.hour}:${o.minute}`;
+  } catch { return utcISOString; }
+}
+function cacheFile(dateYMD) { return path.join(DATA_DIR, `predictions-${dateYMD}.json`); }
+function loadCache(dateYMD) {
+  const f = cacheFile(dateYMD);
+  if (fs.existsSync(f)) try { return JSON.parse(fs.readFileSync(f, 'utf-8')); } catch {}
+  return null;
+}
+function saveCache(dateYMD, rows) {
+  const f = cacheFile(dateYMD);
+  fs.writeFileSync(f, JSON.stringify({ date: dateYMD, rows, savedAt: new Date().toISOString() }, null, 2));
 }
 
-app.get('/api/today', (req, res) => {
+// ---- API-Football source ----
+async function fetchJson(url, headers) {
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function sourceApiFootballToday(dateYMD) {
+  const apiKey = process.env.API_FOOTBALL_KEY;
+  if (!apiKey) return { rows: [], reason: 'no_api_key' };
+
+  const base = 'https://v3.football.api-sports.io';
+  // Support both header styles (APISports direct & RapidAPI)
+  const headersList = [
+    { 'x-apisports-key': apiKey },
+    { 'x-rapidapi-key': apiKey, 'x-rapidapi-host': 'v3.football.api-sports.io' }
+  ];
+
+  for (const headers of headersList) {
+    try {
+      // IMPORTANT: pass timezone to fixtures so the date aligns to Istanbul
+      const fxUrl = `${base}/fixtures?date=${dateYMD}&timezone=${encodeURIComponent(TZ)}`;
+      const fxJson = await fetchJson(fxUrl, headers);
+      const fixtures = fxJson?.response || [];
+      if (!fixtures.length) continue;
+
+      const out = [];
+      for (const f of fixtures) {
+        const fixtureId = f.fixture?.id;
+        const league = `${f.league?.country || ''} ${f.league?.name || ''}`.trim();
+        const kickoff = toLocalISO(f.fixture?.date);
+        const home = f.teams?.home?.name || 'Home';
+        const away = f.teams?.away?.name || 'Away';
+
+        // Default (in case predictions endpoint not in plan): show fixture without pick
+        let prediction = '—';
+        let confidence = '';
+
+        if (fixtureId) {
+          try {
+            const pUrl = `${base}/predictions?fixture=${fixtureId}`;
+            const pJson = await fetchJson(pUrl, headers);
+            const pred = pJson?.response?.[0];
+            if (pred?.predictions?.winner?.name) {
+              const w = pred.predictions.winner.name;
+              if (/home/i.test(w)) prediction = '1';
+              else if (/away/i.test(w)) prediction = '2';
+              else if (/draw/i.test(w)) prediction = 'X';
+              else prediction = w;
+            }
+            if (pred?.predictions?.percent) {
+              const { home: ph, draw: pd, away: pa } = pred.predictions.percent;
+              const nums = [ph, pd, pa].map(x => parseFloat(String(x).replace('%','')) || 0);
+              const max = Math.max(...nums);
+              confidence = `${max}%`;
+            }
+          } catch (e) {
+            // If predictions is not available on your plan, we simply leave "—"
+          }
+        }
+
+        out.push({ league, kickoff, home, away, prediction, confidence, source: 'API-Football' });
+      }
+      return { rows: out, reason: 'ok' };
+    } catch (e) {
+      // Try next header style
+    }
+  }
+  return { rows: [], reason: 'api_error_or_no_plan' };
+}
+
+// ---- Collection (no demo unless there is absolutely nothing) ----
+async function collectToday(dateYMD) {
+  const api = await sourceApiFootballToday(dateYMD);
+  let rows = api.rows;
+
+  // Only if we truly have nothing, keep a tiny neutral placeholder (or leave blank)
+  if (!rows.length) {
+    // Return empty to avoid confusing "yesterday-like" demos
+    rows = [];
+  }
+
+  rows.sort((x,y) => (x.kickoff||'').localeCompare(y.kickoff||'') || (x.league||'').localeCompare(y.league||'') || (x.home||'').localeCompare(y.home||''));
+  return rows;
+}
+
+// ---- Warm cache on boot and at 00:01 daily ----
+async function warm(dateYMD) {
+  const rows = await collectToday(dateYMD);
+  saveCache(dateYMD, rows);
+  console.log(`[warm] cached ${rows.length} rows for ${dateYMD}`);
+  return rows;
+}
+(async () => {
   const d = todayYMD();
-  res.json({ date: d, rows: [{ league: 'Premier League', kickoff: '19:00', home: 'Arsenal', away: 'Chelsea', prediction: '1', confidence: '68%' }] });
+  await warm(d);
+})();
+
+cron.schedule('1 0 * * *', async () => {
+  const d = todayYMD();
+  await warm(d);
+}, { timezone: TZ });
+
+// ---- API ----
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+app.get('/api/today', async (_req, res) => {
+  const d = todayYMD();
+  const cached = loadCache(d);
+  if (cached) return res.json(cached);
+  const rows = await warm(d);
+  res.json({ date: d, rows, savedAt: new Date().toISOString() });
 });
 
-const INDEX_HTML =
-  '<!doctype html>\n' +
-  '<html lang="en">\n' +
-  '<head>\n' +
-  '  <meta charset="utf-8" />\n' +
-  '  <meta name="viewport" content="width=device-width, initial-scale=1" />\n' +
-  '  <title>Today&#39;s Football Predictions</title>\n' +
-  '  <script src="https://cdn.tailwindcss.com"></script>\n' +
-  '</head>\n' +
-  '<body class="bg-slate-50 text-slate-900">\n' +
-  '  <div class="max-w-7xl mx-auto p-4">\n' +
-  '    <h1 class="text-3xl font-bold">Today&#39;s Football Predictions</h1>\n' +
-  '    <table class="min-w-full text-sm mt-4"><thead><tr><th>Kickoff</th><th>League</th><th>Home</th><th>Away</th><th>Prediction</th><th>Confidence</th></tr></thead><tbody id="rows"></tbody></table>\n' +
-  '    <script>\n' +
-  '    async function load(){\n' +
-  '      const res=await fetch("/api/today");\n' +
-  '      const data=await res.json();\n' +
-  '      document.getElementById("rows").innerHTML=data.rows.map(r=>`<tr><td>${r.kickoff}</td><td>${r.league}</td><td>${r.home}</td><td>${r.away}</td><td>${r.prediction}</td><td>${r.confidence}</td></tr>`).join("");\n' +
-  '    }\n' +
-  '    load();\n' +
-  '    </script>\n' +
-  '  </div>\n' +
-  '</body>\n' +
-  '</html>';
+// ---- Frontend ----
+const INDEX_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Today’s Football Predictions</title>
+  <meta name="description" content="Broadcast of daily football match predictions." />
+  <script src="https://cdn.tailwindcss.com"></script>
 
-app.get('/', (req, res) => {
+  <!-- Google AdSense (paste real code when approved) -->
+  <!--
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=YOUR-ADSENSE-CLIENT" crossorigin="anonymous"></script>
+  -->
+
+  <style> thead.sticky th{ position: sticky; top:0; z-index: 10; box-shadow: 0 1px 0 rgba(0,0,0,.05); } </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-7xl mx-auto p-4">
+
+    <header class="mb-6 flex items-center justify-between">
+      <div>
+        <h1 class="text-3xl font-extrabold tracking-tight">Predictions for <span id="dateLabel">—</span></h1>
+        <p class="text-sm text-slate-600">Auto-updates daily at 00:01 (Istanbul time). Informational only.</p>
+      </div>
+      <a href="#subscribe" class="rounded-xl px-3 py-2 text-sm border hover:bg-slate-100">Subscribe</a>
+    </header>
+
+    <!-- Top ad slot -->
+    <div class="mb-4 bg-white rounded-2xl shadow p-4 min-h-24 flex items-center justify-center text-slate-500">
+      <!-- AdSense: paste your <ins class="adsbygoogle"> block here with push() -->
+      <span class="text-xs uppercase tracking-wide">Ad Space (Responsive)</span>
+    </div>
+
+    <div class="overflow-x-auto bg-white rounded-2xl shadow">
+      <table class="min-w-full text-sm" id="tbl">
+        <thead class="bg-slate-100 sticky"><tr>
+          <th class="text-left p-3">Kickoff</th>
+          <th class="text-left p-3">League</th>
+          <th class="text-left p-3">Home</th>
+          <th class="text-left p-3">Away</th>
+          <th class="text-left p-3">Pick (1/X/2)</th>
+          <th class="text-left p-3">Confidence</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+
+    <!-- Inline ad slot -->
+    <div class="mt-4 bg-white rounded-2xl shadow p-4 min-h-24 flex items-center justify-center text-slate-500">
+      <!-- AdSense block can go here -->
+      <span class="text-xs uppercase tracking-wide">Ad Space</span>
+    </div>
+
+    <section id="subscribe" class="mt-6 bg-sky-600 text-white rounded-2xl shadow p-6">
+      <h2 class="text-xl font-semibold mb-2">Get daily predictions by email</h2>
+      <form id="subForm" class="flex flex-col sm:flex-row gap-3" method="post" action="/subscribe">
+        <input type="email" name="email" required placeholder="you@example.com" class="flex-1 rounded-xl px-4 py-2 text-slate-900" />
+        <input type="text" name="company" class="hidden" tabindex="-1" autocomplete="off" />
+        <button class="rounded-xl px-4 py-2 bg-white text-blue-700 font-semibold hover:bg-slate-100" type="submit">Subscribe</button>
+      </form>
+      <p id="subMsg" class="mt-2 text-sm"></p>
+    </section>
+
+    <footer class="mt-8 text-xs text-slate-500 text-center"><p>Respect providers’ terms.</p></footer>
+  </div>
+
+  <script>
+    const rowsEl = document.getElementById('rows');
+    const subForm = document.getElementById('subForm');
+    const subMsg = document.getElementById('subMsg');
+    const dateLabel = document.getElementById('dateLabel');
+
+    async function load() {
+      const res = await fetch('/api/today');
+      const data = await res.json();
+      const rows = data.rows || [];
+      if (dateLabel && data.date) dateLabel.textContent = data.date;
+
+      rowsEl.innerHTML = rows.map(r => \`
+        <tr class="border-b last:border-0">
+          <td class="p-3 whitespace-nowrap">\${r.kickoff||''}</td>
+          <td class="p-3">\${r.league||''}</td>
+          <td class="p-3 font-medium">\${r.home||''}</td>
+          <td class="p-3">\${r.away||''}</td>
+          <td class="p-3">\${r.prediction||''}</td>
+          <td class="p-3">\${r.confidence||''}</td>
+        </tr>\`
+      ).join('');
+    }
+    load();
+    // Refresh every 10 minutes in case API updates within the day
+    setInterval(load, 10 * 60 * 1000);
+
+    subForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(subForm);
+      const resp = await fetch('/subscribe', { method: 'POST', body: fd });
+      try { const r = await resp.json(); subMsg.textContent = r.message || 'Subscribed!'; }
+      catch { subMsg.textContent = 'Subscribed!'; }
+    });
+  </script>
+</body>
+</html>`;
+
+// ---- Routes ----
+app.get('/', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(INDEX_HTML);
 });
 
-app.listen(PORT, () => console.log('✅ Server running on', PORT));
+app.post('/subscribe', (req, res) => {
+  if (req.body && req.body.company) return res.json({ ok: true, message: 'Thanks!' }); // honeypot
+  const email = (req.body?.email || '').toString().trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ ok:false, message:'Invalid email' });
+  try {
+    const file = path.join(DATA_DIR, 'subscribers.csv');
+    if (!fs.existsSync(file)) fs.writeFileSync(file, 'email,ts\n');
+    fs.appendFileSync(file, `${email},${new Date().toISOString()}\n`);
+  } catch (e) {
+    return res.status(500).json({ ok:false, message:'Could not save subscription' });
+  }
+  res.json({ ok:true, message:'Check your inbox to confirm (simulated).' });
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Server listening on ${PORT}`);
+});
