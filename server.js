@@ -1,9 +1,6 @@
-// server.js — AI Picks v5.2 (Strongest-Market Selection)
-// Compares 1X2 vs Over/Under 2.5 vs BTTS and outputs the market
-// with the largest confidence EDGE over its neutral baseline.
-// - Neutral baselines: 1X2 → 0.33, Totals/BTTS → 0.50
-// - Edge = prob - baseline
-// - Only emit if edge ≥ EDGE_MIN (default 8%); else fallback to best 1X2
+// server.js — AI Picks v5.2.1 (Strongest-Market Selection) — FIXED
+// - Removes duplicate leagueBaseGpm definition (caused 'Identifier already declared').
+// - Compares 1X2 vs Over/Under 2.5 vs BTTS and outputs the market with largest EDGE.
 //
 // Data: football-data.org (FOOTBALL_DATA_KEY required)
 // Time window: 11:00–24:00 TRT (config START_HOUR)
@@ -85,7 +82,7 @@ function seedOf(name){
   return SEED_ELO[key] ?? SEED_ELO[normTeam(name)] ?? 1500;
 }
 
-// ---------- League baseline GPM
+// ---------- League baseline GPM (single definition)
 function leagueBaseGpm(league=''){
   const k = (league||'').toLowerCase();
   if (k.includes('super lig') || k.includes('süper lig')) return 2.7;
@@ -196,19 +193,6 @@ function sharpen3(pH, pD, pA, tau){
   return { pH: a/Z, pD: b/Z, pA: c/Z };
 }
 
-function leagueBaseGpm(league=''){
-  const k = (league||'').toLowerCase();
-  if (k.includes('super lig') || k.includes('süper lig')) return 2.7;
-  if (k.includes('premier')) return 2.9;
-  if (k.includes('la liga')) return 2.6;
-  if (k.includes('bundesliga')) return 3.1;
-  if (k.includes('serie a')) return 2.5;
-  if (k.includes('ligue 1')) return 2.75;
-  if (k.includes('eredivisie')) return 3.0;
-  if (k.includes('primeira')) return 2.5;
-  return 2.65;
-}
-
 function expectedGoalsAdvanced(homeName, awayName, leagueName, homeForm, awayForm){
   const baseG = leagueBaseGpm(leagueName);
   const HOME_ELO = 65;
@@ -253,13 +237,19 @@ function chooseStrongest(lh, la){
     { market:bestBTTS.market, label:bestBTTS.label, prob:bestBTTS.p, edge:edgeBTTS, base:0.50 },
   ].sort((a,b)=> b.edge - a.edge);
 
-  // If top edge is small, fallback to 1X2 best (still show its prob).
   const top = candidates[0];
   if (top.edge >= EDGE_MIN) return top;
   return { market:'1X2', label:best1.label, prob:best1.p, edge:edge1, base:0.33, note:'low-edge-fallback' };
 }
 
 // ---------- Fetch fixtures and build rows
+const H = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' }; // (redeclared earlier? keep single)
+async function fetchJson(url){
+  const res = await fetch(url, { headers: H });
+  const txt = await res.text();
+  try { return JSON.parse(txt); } catch { return { raw: txt }; }
+}
+
 async function fetchFixturesToday(withExplain=false){
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
@@ -268,7 +258,7 @@ async function fetchFixturesToday(withExplain=false){
   const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
   const endUtc = end.toISOString().split('T')[0];
   const url = `https://api.football-data.org/v4/matches?dateFrom=${startUtc}&dateTo=${endUtc}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
-  const j = await getJson(url);
+  const j = await fetchJson(url);
   const arr = Array.isArray(j?.matches) ? j.matches : [];
 
   const rows = [];
@@ -306,7 +296,7 @@ async function fetchFixturesToday(withExplain=false){
       }
     } catch (e) {}
 
-    const pct = Math.round(out?.prob * 100);
+    const pct = Math.round((out?.prob || 0) * 100);
     const edgePct = Math.round(Math.max(0, (out?.edge || 0) * 100));
     const row = {
       league, kickoffIso, kickoff: toLocalLabel(kickoffIso),
@@ -356,14 +346,14 @@ const INDEX_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today's Matches — AI Picks v5.2</title>
+  <title>Today's Matches — AI Picks v5.2.1</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-6xl mx-auto p-4 space-y-3">
     <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v5.2</h1>
+      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v5.2.1</h1>
       <div class="space-x-3 text-xs">
         <a href="/diag" class="underline opacity-70 hover:opacity-100">Diag</a>
         <a href="/explain" class="underline opacity-70 hover:opacity-100">Explain</a>
@@ -381,7 +371,7 @@ const INDEX_HTML = `<!doctype html>
         <tbody id="rows"></tbody>
       </table>
     </div>
-    <p class="text-[12px] text-slate-500">Now chooses the single strongest market by edge over neutral.</p>
+    <p class="text-[12px] text-slate-500">Chooses the single strongest market by edge over neutral.</p>
   </div>
   <script>
     async function load(){
