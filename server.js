@@ -1,5 +1,4 @@
-// server.js — Render port binding fix + immediate startup
-// Uses Football-Data.org and shows matches 11:00–24:00 TRT. No top-level await.
+// server.js — Football-Data.org, no escape bug, Render-ready
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -8,7 +7,7 @@ dotenv.config();
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const HOST = '0.0.0.0'; // important for Render
+const HOST = '0.0.0.0';
 const TZ = process.env.TZ || 'Europe/Istanbul';
 const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const START_HOUR = parseInt(process.env.START_HOUR || '11', 10);
@@ -110,56 +109,59 @@ app.get('/diag', async (_req, res) => {
   }
 });
 
-const INDEX_HTML =
-'<!doctype html>\n'+
-'<html lang="en">\n'+
-'<head>\n'+
-'  <meta charset="utf-8" />\n'+
-'  <meta name="viewport" content="width=device-width, initial-scale=1" />\n'+
-'  <title>Today\'+"'"+'s Matches (Football-Data.org)</title>\n'+
-'  <script src="https://cdn.tailwindcss.com"></script>\n'+
-'  <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>\n'+
-'</head>\n'+
-'<body class="bg-slate-50 text-slate-900">\n'+
-'  <div class="max-w-6xl mx-auto p-4 space-y-3">\n'+
-'    <header class="flex items-center justify-between">\n'+
-'      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT)</h1>\n'+
-'      <a href="/diag" class="text-xs underline opacity-70 hover:opacity-100">Diagnostics</a>\n'+
-'    </header>\n'+
-'    <div class="overflow-x-auto bg-white rounded-2xl shadow">\n'+
-'      <table class="min-w-full text-sm" id="tbl">\n'+
-'        <thead class="bg-slate-100 sticky"><tr>\n'+
-'          <th class="text-left p-3">Kickoff</th>\n'+
-'          <th class="text-left p-3">League</th>\n'+
-'          <th class="text-left p-3">Home</th>\n'+
-'          <th class="text-left p-3">Away</th>\n'+
-'        </tr></thead>\n'+
-'        <tbody id="rows"></tbody>\n'+
-'      </table>\n'+
-'    </div>\n'+
-'  </div>\n'+
-'  <script>\n'+
-'    async function load(){\n'+
-'      const res = await fetch("/api/today");\n'+
-'      const data = await res.json();\n'+
-'      const rows = data.rows || [];\n'+
-'      document.getElementById("rows").innerHTML = rows.map(r => (\n'+
-'        "<tr class=\\\"border-b last:border-0\\\">"+\n'+
-'          "<td class=\\\"p-3 whitespace-nowrap\\\">"+ (r.kickoff||"") +"</td>"+\n'+
-'          "<td class=\\\"p-3\\\">"+ (r.league||"") +"</td>"+\n'+
-'          "<td class=\\\"p-3 font-medium\\\">"+ (r.home||"") +"</td>"+\n'+
-'          "<td class=\\\"p-3\\\">"+ (r.away||"") +"</td>"+\n'+
-'        "</tr>"\n'+
-'      )).join("");\n'+
-'    }\n'+
-'    load();\n'+
-'    setInterval(load, 5*60*1000);\n'+
-'  </script>\n'+
-'</body>\n'+
-'</html>';
+const INDEX_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Today's Matches (Football-Data.org)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-6xl mx-auto p-4 space-y-3">
+    <header class="flex items-center justify-between">
+      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT)</h1>
+      <a href="/diag" class="text-xs underline opacity-70 hover:opacity-100">Diagnostics</a>
+    </header>
+    <div class="overflow-x-auto bg-white rounded-2xl shadow">
+      <table class="min-w-full text-sm" id="tbl">
+        <thead class="bg-slate-100 sticky"><tr>
+          <th class="text-left p-3">Kickoff</th>
+          <th class="text-left p-3">League</th>
+          <th class="text-left p-3">Home</th>
+          <th class="text-left p-3">Away</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+  <script>
+    async function load(){
+      const res = await fetch("/api/today");
+      const data = await res.json();
+      const rows = data.rows || [];
+      document.getElementById("rows").innerHTML = rows.map(r => (
+        "<tr class='border-b last:border-0'>" +
+          "<td class='p-3 whitespace-nowrap'>" + (r.kickoff||"") + "</td>" +
+          "<td class='p-3'>" + (r.league||"") + "</td>" +
+          "<td class='p-3 font-medium'>" + (r.home||"") + "</td>" +
+          "<td class='p-3'>" + (r.away||"") + "</td>" +
+        "</tr>"
+      )).join("");
+    }
+    load();
+    setInterval(load, 5*60*1000);
+  </script>
+</body>
+</html>`;
 
-const server = app.listen(PORT, HOST, () => {
-  console.log('✅ Server listening on', HOST + ':' + PORT);
-  // warm cache AFTER port is bound so Render sees open port
+app.get('/', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(INDEX_HTML);
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`✅ Server listening on ${HOST}:${PORT}`);
   warmCache();
 });
