@@ -1,4 +1,5 @@
-// server.js — using Football-Data.org API (free) for fixtures
+// server.js — Render port binding fix + immediate startup
+// Uses Football-Data.org and shows matches 11:00–24:00 TRT. No top-level await.
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -6,7 +7,8 @@ import cron from 'node-cron';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = '0.0.0.0'; // important for Render
 const TZ = process.env.TZ || 'Europe/Istanbul';
 const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const START_HOUR = parseInt(process.env.START_HOUR || '11', 10);
@@ -72,15 +74,21 @@ async function getTodayFixturesFiltered() {
   return { date, rows, totalFromApi: arr.length };
 }
 
+// In-memory cache
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
-  const res = await getTodayFixturesFiltered();
-  CACHE = { ...res, savedAt: new Date().toISOString() };
-  return CACHE;
+  try {
+    const res = await getTodayFixturesFiltered();
+    CACHE = { ...res, savedAt: new Date().toISOString() };
+  } catch (e) {
+    CACHE = { date: todayYMD(), rows: [], savedAt: new Date().toISOString(), error: String(e.message || e) };
+  }
 }
-await warmCache();
+
+// Schedule nightly refresh 00:01
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
+// Routes
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -108,14 +116,14 @@ const INDEX_HTML =
 '<head>\n'+
 '  <meta charset="utf-8" />\n'+
 '  <meta name="viewport" content="width=device-width, initial-scale=1" />\n'+
-'  <title>Today&#39;s Fixtures (Football-Data.org)</title>\n'+
+'  <title>Today\'+"'"+'s Matches (Football-Data.org)</title>\n'+
 '  <script src="https://cdn.tailwindcss.com"></script>\n'+
 '  <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>\n'+
 '</head>\n'+
 '<body class="bg-slate-50 text-slate-900">\n'+
 '  <div class="max-w-6xl mx-auto p-4 space-y-3">\n'+
 '    <header class="flex items-center justify-between">\n'+
-'      <h1 class="text-2xl font-bold">Today&#39;s Matches (11:00–24:00 TRT)</h1>\n'+
+'      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT)</h1>\n'+
 '      <a href="/diag" class="text-xs underline opacity-70 hover:opacity-100">Diagnostics</a>\n'+
 '    </header>\n'+
 '    <div class="overflow-x-auto bg-white rounded-2xl shadow">\n'+
@@ -150,9 +158,8 @@ const INDEX_HTML =
 '</body>\n'+
 '</html>';
 
-app.get('/', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(INDEX_HTML);
+const server = app.listen(PORT, HOST, () => {
+  console.log('✅ Server listening on', HOST + ':' + PORT);
+  // warm cache AFTER port is bound so Render sees open port
+  warmCache();
 });
-
-app.listen(PORT, () => console.log('✅ Server listening on', PORT));
