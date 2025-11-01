@@ -1,6 +1,6 @@
 {
-  "name": "football-matches-footballdata-aipicks-v5-2-1",
-  "version": "5.2.1",
+  "name": "football-matches-footballdata-aipicks-v5-2-2",
+  "version": "5.2.2",
   "type": "module",
   "main": "server.js",
   "engines": {
