@@ -1,4 +1,3 @@
-\
 // server.js — Football-Data.org fixtures + local AI (1/X/2) predictions
 // Render-ready: binds 0.0.0.0:$PORT, daily refresh, time-window filter, Tailwind UI.
 import express from 'express';
