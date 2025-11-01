@@ -1,8 +1,11 @@
-// server.js — AI Picks v3
-// First predict 1X2 (win/draw/lose) using seeded strength + last-5 form + opponent standing
-// Then, if 1X2 edge is weak, pick a goals market (Over/Under 2.5, BTTS, Home O1.5).
-// Data source for fixtures, standings, recent matches: Football-Data.org (free key needed for fixtures; other endpoints are used best-effort).
-// Render-ready (0.0.0.0:$PORT), Istanbul timezone window (11:00–24:00), nightly refresh.
+// server.js — AI Picks v4
+// Strategy:
+// 1) Compute 1X2 probabilities from expected goals (Poisson).
+// 2) If 1X2 edge is weak (best < 58%), prefer a goals market:
+//    a) Pick Over/Under 2.5 if max(prob) >= 60%
+//    b) Else pick BTTS (Yes/No) if max(prob) >= 58%
+//    c) Else fall back to best 1X2
+// Form source = last 5 *league* matches only (same competition as fixture).
 
 import express from 'express';
 import dotenv from 'dotenv';
@@ -23,7 +26,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.disable('x-powered-by');
 
-// ---- Helpers: time & formatting
+// ---- Helpers: time
 function fmtYMD(d, tz = TZ) {
   const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
   return f.format(d);
@@ -45,7 +48,7 @@ function toLocalLabel(iso, tz = TZ) {
 }
 function normTeam(s=''){ return s.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); }
 
-// ---- Seeds (baseline Elo-like strengths). Others default to 1500.
+// ---- seed strengths (Elo-like). Unlisted default to 1500.
 const SEED_ELO = {
   'real madrid':1850,'barcelona':1820,'manchester city':1880,'liverpool':1820,'arsenal':1800,
   'chelsea':1750,'manchester united':1760,'bayern munich':1900,'inter':1820,'juventus':1800,
@@ -53,7 +56,7 @@ const SEED_ELO = {
   'galatasaray':1700,'fenerbahce':1680,'besiktas':1650,'trabzonspor':1620
 };
 
-// ---- League base goals per match (heuristic)
+// ---- league baseline goals per match (heuristic)
 function leagueBaseGpm(league=''){
   const k = (league||'').toLowerCase();
   if (k.includes('super lig') || k.includes('süper lig')) return 2.7;
@@ -67,16 +70,15 @@ function leagueBaseGpm(league=''){
   return 2.65;
 }
 
-// ---- Minimal fetch with auth + small delay between calls (rate friendly)
+// ---- fetch helper
 const H = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' };
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function getJson(url){
   const res = await fetch(url, { headers: H });
   const txt = await res.text();
   try { return JSON.parse(txt); } catch { return { raw: txt }; }
 }
 
-// ---- Standings cache by competition id -> map(teamId -> position)
+// ---- standings cache (competitionId -> Map(teamId -> position))
 const standingsCache = new Map();
 async function getStandingsMap(compId){
   if (standingsCache.has(compId)) return standingsCache.get(compId);
@@ -92,27 +94,28 @@ async function getStandingsMap(compId){
   } catch { return new Map(); }
 }
 
-// ---- Recent form cache: teamId -> array of finished matches (last 5, mixed home/away)
-const formCache = new Map();
-async function getLastMatches(teamId){
-  if (formCache.has(teamId)) return formCache.get(teamId);
-  // pull last ~45 days finished to approximate last 5
+// ---- last 5 *league* matches (filter by same competition id)
+const formCache = new Map(); // key `${teamId}:${compId}`
+async function getLastLeagueMatches(teamId, compId){
+  const key = `${teamId}:${compId}`;
+  if (formCache.has(key)) return formCache.get(key);
   const end = new Date();
-  const start = new Date(end.getTime() - 45*24*3600*1000);
+  const start = new Date(end.getTime() - 60*24*3600*1000);
   const dateFrom = start.toISOString().slice(0,10);
   const dateTo = end.toISOString().slice(0,10);
   const url = `https://api.football-data.org/v4/teams/${teamId}/matches?status=FINISHED&dateFrom=${dateFrom}&dateTo=${dateTo}`;
   const j = await getJson(url);
-  const arr = Array.isArray(j?.matches) ? j.matches : [];
-  // take last 5 by utcDate desc
+  let arr = Array.isArray(j?.matches) ? j.matches : [];
+  // Only same competition to avoid cups skewing
+  arr = arr.filter(m => m.competition?.id === compId);
   arr.sort((a,b)=> (b.utcDate||'').localeCompare(a.utcDate||''));
   const last5 = arr.slice(0,5);
-  formCache.set(teamId, last5);
+  formCache.set(key, last5);
   return last5;
 }
 
-// ---- Compute form metrics
-function formStats(teamId, teamName, matches, standingsMap){
+// ---- form stats
+function formStats(teamId, matches, standingsMap){
   let pts=0, gf=0, ga=0, homeGF=0, homeGA=0, awayGF=0, awayGA=0, oppPosSum=0, oppCount=0;
   for (const m of matches){
     const isHome = m.homeTeam?.id === teamId;
@@ -122,27 +125,18 @@ function formStats(teamId, teamName, matches, standingsMap){
     const agGoals = isHome ? a : h;
     gf += forGoals; ga += agGoals;
     if (isHome) { homeGF += h; homeGA += a; } else { awayGF += a; awayGA += h; }
-
-    // points
-    if (forGoals > agGoals) pts += 3;
-    else if (forGoals === agGoals) pts += 1;
-
-    // opponent standing
+    if (forGoals > agGoals) pts += 3; else if (forGoals === agGoals) pts += 1;
     const oppId = isHome ? m.awayTeam?.id : m.homeTeam?.id;
-    if (oppId && standingsMap?.has(oppId)) {
-      oppPosSum += standingsMap.get(oppId);
-      oppCount += 1;
-    }
+    if (oppId && standingsMap?.has(oppId)) { oppPosSum += standingsMap.get(oppId); oppCount += 1; }
   }
   const gPlayed = matches.length || 1;
   const ppm = pts / gPlayed;
-  const gfpm = gf / gPlayed;
-  const gapm = ga / gPlayed;
+  const gfpm = gf / gPlayed, gapm = ga / gPlayed;
   const homeGP = matches.filter(m => m.homeTeam?.id === teamId).length || 1;
   const awayGP = gPlayed - homeGP || 1;
   const homeGFpm = homeGF / homeGP, homeGApm = homeGA / homeGP;
   const awayGFpm = awayGF / awayGP, awayGApm = awayGA / awayGP;
-  const oppAvgPos = oppCount ? (oppPosSum / oppCount) : 10; // lower is stronger
+  const oppAvgPos = oppCount ? (oppPosSum / oppCount) : 10;
   return { ppm, gfpm, gapm, homeGFpm, homeGApm, awayGFpm, awayGApm, oppAvgPos, gPlayed };
 }
 
@@ -150,7 +144,7 @@ function formStats(teamId, teamName, matches, standingsMap){
 function fac(n){ let r=1; for(let i=2;i<=n;i++) r*=i; return r; }
 function poisPmf(lam, k){ return Math.exp(-lam) * Math.pow(lam, k) / fac(k); }
 function poisCdf(lam, k){ let s=0; for(let i=0;i<=k;i++) s += poisPmf(lam,i); return s; }
-function probs1X2(lh, la, cap=10){
+function probs1X2(lh, la, cap=12){
   let pH=0, pD=0, pA=0;
   for(let i=0;i<=cap;i++){
     const ph = poisPmf(lh, i);
@@ -162,77 +156,59 @@ function probs1X2(lh, la, cap=10){
   const s = pH+pD+pA || 1; return { pH: pH/s, pD: pD/s, pA: pA/s };
 }
 
-// ---- Expected goals from league baseline + recent form + opponent strength
+// ---- expected goals: league base + seeds + form + small home edge
 function expectedGoalsAdvanced(homeName, awayName, leagueName, homeForm, awayForm){
   const baseG = leagueBaseGpm(leagueName);
-  const HOME_ADV_ELO = 50;
-  const seeds = (nm)=> SEED_ELO[normTeam(nm)] ?? 1500;
-  const rh = seeds(homeName), ra = seeds(awayName);
-  const seedDiff = (rh + HOME_ADV_ELO) - ra;
+  const HOME_ELO = 55;
+  const rh = SEED_ELO[normTeam(homeName)] ?? 1500;
+  const ra = SEED_ELO[normTeam(awayName)] ?? 1500;
+  const seedDiff = (rh + HOME_ELO) - ra;
 
-  // Form adjustments (per-match)
-  const homeAttack = 0.6*homeForm.homeGFpm + 0.4*homeForm.gfpm;
-  const awayAttack = 0.6*awayForm.awayGFpm + 0.4*awayForm.gfpm;
+  const posFactor = pos => Math.max(0.8, Math.min(1.2, 1 + (10 - pos)*0.02));
+  const homeOpp = posFactor(homeForm.oppAvgPos);
+  const awayOpp = posFactor(awayForm.oppAvgPos);
+
+  const homeAtk = 0.6*homeForm.homeGFpm + 0.4*homeForm.gfpm;
+  const awayAtk = 0.6*awayForm.awayGFpm + 0.4*awayForm.gfpm;
   const homeDef = 0.6*homeForm.homeGApm + 0.4*homeForm.gapm;
   const awayDef = 0.6*awayForm.awayGApm + 0.4*awayForm.gapm;
 
-  // Opponent strength via standings (lower position = stronger opposition faced)
-  // Convert avg position to a factor around 1.0:
-  const posToFactor = (pos)=> Math.max(0.8, Math.min(1.2, 1.0 + (10 - pos) * 0.02));
-  const homeOppFac = posToFactor(homeForm.oppAvgPos);
-  const awayOppFac = posToFactor(awayForm.oppAvgPos);
+  let split = 0.5 + 0.12*Math.tanh(seedDiff/650);
+  const atkBias = (homeAtk/(homeDef+0.1)) / ((awayAtk/(awayDef+0.1))+0.01);
+  split = Math.max(0.36, Math.min(0.64, split * Math.pow(atkBias, 0.12)));
 
-  // Own strength factor from seeds
-  const seedFacHome = 1.0 + seedDiff/2000; // small bump
-  const seedFacAway = 1.0 - seedDiff/2000;
-
-  // Allocate total goals; tilt by attack vs defense & seed
-  let split = 0.5 + 0.12*Math.tanh(seedDiff/600);
-  // quality interaction
-  const atkBias = (homeAttack/(homeDef+0.1)) / ((awayAttack/(awayDef+0.1))+0.01);
-  split = Math.max(0.35, Math.min(0.65, split * Math.pow(atkBias, 0.12)));
-
-  // Convert to lambdas
-  let lambdaHome = baseG * split * seedFacHome * homeOppFac * (homeAttack+0.8) / (awayDef+0.8);
-  let lambdaAway = baseG * (1 - split) * seedFacAway * awayOppFac * (awayAttack+0.8) / (homeDef+0.8);
-
-  // Keep in realistic range
-  lambdaHome = Math.max(0.2, Math.min(3.2, lambdaHome));
-  lambdaAway = Math.max(0.2, Math.min(3.2, lambdaAway));
-
-  return { lambdaHome, lambdaAway, seedDiff };
+  let lh = baseG * split * (1 + seedDiff/2200) * homeOpp * (homeAtk+0.8)/(awayDef+0.8);
+  let la = baseG * (1 - split) * (1 - seedDiff/2200) * awayOpp * (awayAtk+0.8)/(homeDef+0.8);
+  lh = Math.max(0.15, Math.min(3.0, lh));
+  la = Math.max(0.15, Math.min(3.0, la));
+  return { lh, la };
 }
 
-// ---- Decision logic: try 1X2 first; if weak edge, switch to goals
+// ---- decision: prioritize totals if 1X2 risky
 function decidePick(lh, la){
-  const { pH, pD, pA } = probs1X2(lh, la, 12);
+  const { pH, pD, pA } = probs1X2(lh, la);
   const best1x2 = [{label:'1',p:pH},{label:'X',p:pD},{label:'2',p:pA}].sort((a,b)=>b.p-a.p)[0];
-  const edge = best1x2.p - (1/3); // edge above random 1/3
-  // Goals markets
-  const lt = lh + la;
-  const pUnder25 = poisCdf(lt, 2);
-  const pOver25 = 1 - pUnder25;
+
+  const totLam = lh + la;
+  const pU25 = poisCdf(totLam, 2);
+  const pO25 = 1 - pU25;
+
   const pBTTS = 1 - (Math.exp(-lh) + Math.exp(-la) - Math.exp(-lh-la));
-  const pHomeOver15 = 1 - poisCdf(lh, 1);
+  const bestBTTS = pBTTS >= 0.5 ? { market:'BTTS', label:'Yes', prob:pBTTS } : { market:'BTTS', label:'No', prob:1-pBTTS };
 
-  // If 1X2 is meaningfully better, keep it; else choose best goals market
-  if (edge >= 0.08) { // ≥8% better than random
-    return { market: '1X2', label: best1x2.label, prob: best1x2.p };
+  // thresholds
+  const oneX2Risky = best1x2.p < 0.58;
+  if (oneX2Risky) {
+    const bestTotals = pO25 >= pU25
+      ? { market:'Over/Under 2.5', label:'Over 2.5', prob:pO25 }
+      : { market:'Over/Under 2.5', label:'Under 2.5', prob:pU25 };
+    if (bestTotals.prob >= 0.60) return bestTotals;
+    if (bestBTTS.prob >= 0.58) return bestBTTS;
   }
-  // otherwise prefer the strongest of goals
-  const goals = [
-    { market:'Over/Under 2.5', label:'Over 2.5', prob:pOver25 },
-    { market:'Over/Under 2.5', label:'Under 2.5', prob:pUnder25 },
-    { market:'BTTS', label:'Yes', prob:pBTTS },
-    { market:'Home over 1.5', label:'Home Over 1.5', prob:pHomeOver15 }
-  ].sort((a,b)=> b.prob - a.prob)[0];
-
-  // If goals is mediocre (<55%), still fall back to 1X2 top
-  if (goals.prob < 0.55) return { market: '1X2', label: best1x2.label, prob: best1x2.p };
-  return goals;
+  return { market:'1X2', label:best1x2.label, prob:best1x2.p };
 }
 
-// ---- Main: fetch fixtures, enrich with form & standings, then predict
+// ---- fixtures → enrich → predict
 async function fetchFixturesToday(){
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
@@ -258,43 +234,39 @@ async function fetchFixturesToday(){
     const homeId = f.homeTeam?.id;
     const awayId = f.awayTeam?.id;
 
-    let lh=1.3, la=1.2, pick={market:'1X2',label:'1',prob:0.45};
-
+    let pred = { market:'1X2', label:'1', prob:0.4 };
     try {
-      const standingsMap = compId ? await getStandingsMap(compId) : new Map();
-      // rate-limit friendly
-      await sleep(120);
-      const homeLast = homeId ? await getLastMatches(homeId) : [];
-      await sleep(120);
-      const awayLast = awayId ? await getLastMatches(awayId) : [];
+      const standings = compId ? await getStandingsMap(compId) : new Map();
+      const homeMatches = homeId ? await getLastLeagueMatches(homeId, compId) : [];
+      const awayMatches = awayId ? await getLastLeagueMatches(awayId, compId) : [];
 
-      const homeForm = formStats(homeId, homeName, homeLast, standingsMap);
-      const awayForm = formStats(awayId, awayName, awayLast, standingsMap);
-      const eg = expectedGoalsAdvanced(homeName, awayName, league, homeForm, awayForm);
-      lh = eg.lambdaHome; la = eg.lambdaAway;
-      pick = decidePick(lh, la);
+      const homeForm = formStats(homeId, homeMatches, standings);
+      const awayForm = formStats(awayId, awayMatches, standings);
+      const { lh, la } = expectedGoalsAdvanced(homeName, awayName, league, homeForm, awayForm);
+      pred = decidePick(lh, la);
     } catch (e) {
-      // keep defaults; still render row
+      // keep default pred
     }
 
     rows.push({
       league, kickoffIso, kickoff: toLocalLabel(kickoffIso),
       hourLocal, home: homeName, away: awayName,
-      prediction: `${pick.market}: ${pick.label} (${Math.round(pick.prob*100)}%)`
+      prediction: `${pred.market}: ${pred.label} (${Math.round(pred.prob*100)}%)`
     });
   }
 
   rows.sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
   if (!rows.length && FALLBACK_DEMO) {
     rows.push({
-      league: 'Demo League', kickoff: `${date} 19:00`, hourLocal: 19,
-      home: 'Alpha FC', away: 'Beta United', prediction: '1X2: 1 (57%)'
+      league: 'Demo League', kickoff: `${date} 19:00`,
+      hourLocal: 19, home: 'Alpha FC', away: 'Beta United',
+      prediction: 'Over/Under 2.5: Over 2.5 (62%)'
     });
   }
   return { date, rows, totalFromApi: arr.length, apiUrl: url };
 }
 
-// ---- Cache + schedule
+// ---- cache & schedule
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
   try {
@@ -306,7 +278,7 @@ async function warmCache() {
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---- Routes
+// ---- routes
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -327,14 +299,14 @@ const INDEX_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today's Matches — AI Picks v3</title>
+  <title>Today's Matches — AI Picks v4</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-6xl mx-auto p-4 space-y-3">
     <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v3</h1>
+      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v4</h1>
       <a href="/diag" class="text-xs underline opacity-70 hover:opacity-100">Diagnostics</a>
     </header>
     <div class="overflow-x-auto bg-white rounded-2xl shadow">
@@ -349,7 +321,7 @@ const INDEX_HTML = `<!doctype html>
         <tbody id="rows"></tbody>
       </table>
     </div>
-    <p class="text-[12px] text-slate-500">Picks are heuristic. First 1X2, then goals if 1X2 edge is weak. Use at your own risk.</p>
+    <p class="text-[12px] text-slate-500">Picks: prefer O/U 2.5 if 1X2 is risky; else try BTTS; fallback to 1X2. Heuristic only.</p>
   </div>
   <script>
     async function load(){
