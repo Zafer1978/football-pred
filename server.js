@@ -1,4 +1,4 @@
-// server.js — Show only matches between 11:00–24:00 (GMT+3 / Europe/Istanbul) and refresh cache at midnight
+// server.js — Show only matches between 11:00–24:00 (GMT+3 / Europe/Istanbul) and refresh cache at midnight (fixed title apostrophe)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -9,17 +9,16 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const TZ = process.env.TZ || 'Europe/Istanbul';
 const API_KEY = process.env.API_FOOTBALL_KEY || '';
-const START_HOUR = parseInt(process.env.START_HOUR || '11', 10); // 11:00 local by default
-const END_HOUR = 24; // until 00:00 next day (i.e., < 24)
+const START_HOUR = parseInt(process.env.START_HOUR || '11', 10);
+const END_HOUR = 24;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.disable('x-powered-by');
 
-// ---- Time helpers ----
 function fmtYMD(d, tz = TZ) {
   const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  return f.format(d); // YYYY-MM-DD
+  return f.format(d);
 }
 function todayYMD(tz = TZ) { return fmtYMD(new Date(), tz); }
 
@@ -37,7 +36,6 @@ function toLocalLabel(iso, tz = TZ) {
   return `${y}-${pad(m)}-${pad(d)} ${pad(hh)}:${pad(mm)}`;
 }
 
-// ---- API fetch ----
 async function fetchJson(url, headers) {
   const res = await fetch(url, { headers });
   const txt = await res.text();
@@ -59,7 +57,6 @@ async function getTodayFixturesFiltered() {
   const json = await fetchJson(url, headers);
   const arr = Array.isArray(json?.response) ? json.response : [];
 
-  // Map & filter by local time window [START_HOUR, 24)
   const rows = arr.map(f => ({
     league: `${f.league?.country || ''} ${f.league?.name || ''}`.trim(),
     kickoffIso: f.fixture?.date,
@@ -75,29 +72,21 @@ async function getTodayFixturesFiltered() {
   return { date, rows };
 }
 
-// ---- Cache (in-memory since Render restarts occasionally) ----
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
   const res = await getTodayFixturesFiltered().catch(e => ({ date: todayYMD(), rows: [], reason: 'fetch_error', error: String(e.message || e), status: e.status, bodyHead: (e.body || '').slice(0,200) }));
   CACHE = { ...res, savedAt: new Date().toISOString() };
   return CACHE;
 }
-
-// warm at boot
 await warmCache();
-
-// refresh at 00:01 local time every day
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---- API routes ----
 app.get('/api/today', async (_req, res) => {
-  // if cache date mismatches (e.g., after midnight), refresh
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
   res.json(CACHE);
 });
 
-// Optional diagnostics
 app.get('/diag', async (_req, res) => {
   const date = todayYMD();
   const base = 'https://v3.football.api-sports.io/fixtures';
@@ -115,14 +104,13 @@ app.get('/diag', async (_req, res) => {
   }
 });
 
-// ---- Minimal UI ----
 const INDEX_HTML =
 '<!doctype html>\n'+
 '<html lang="en">\n'+
 '<head>\n'+
 '  <meta charset="utf-8" />\n'+
 '  <meta name="viewport" content="width=device-width, initial-scale=1" />\n'+
-'  <title>Today\' + 's Matches (11:00–24:00 TRT)</title>\n'+
+'  <title>Today&#39;s Matches (11:00–24:00 TRT)</title>\n'+
 '  <script src="https://cdn.tailwindcss.com"></script>\n'+
 '  <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>\n'+
 '</head>\n'+
@@ -159,7 +147,7 @@ const INDEX_HTML =
 '      )).join("");\n'+
 '    }\n'+
 '    load();\n'+
-'    setInterval(load, 5*60*1000); // refresh every 5 min for live updates\n'+
+'    setInterval(load, 5*60*1000);\n'+
 '  </script>\n'+
 '</body>\n'+
 '</html>';
