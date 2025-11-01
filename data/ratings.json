@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "teams": {
+    "real madrid": {
+      "elo": 1850
+    },
+    "barcelona": {
+      "elo": 1820
+    },
+    "manchester city": {
+      "elo": 1880
+    },
+    "liverpool": {
+      "elo": 1820
+    },
+    "arsenal": {
+      "elo": 1800
+    },
+    "chelsea": {
+      "elo": 1750
+    },
+    "manchester united": {
+      "elo": 1760
+    },
+    "bayern munich": {
+      "elo": 1900
+    },
+    "borussia dortmund": {
+      "elo": 1780
+    },
+    "inter": {
+      "elo": 1820
+    },
+    "juventus": {
+      "elo": 1800
+    },
+    "milan": {
+      "elo": 1780
+    },
+    "psg": {
+      "elo": 1850
+    },
+    "atletico madrid": {
+      "elo": 1800
+    },
+    "napoli": {
+      "elo": 1780
+    },
+    "roma": {
+      "elo": 1740
+    },
+    "tottenham": {
+      "elo": 1760
+    }
+  }
+}
