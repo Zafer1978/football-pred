@@ -1,6 +1,5 @@
-// server.js — AI Picks v4.1 (aliases + explain + safer home favorite lean)
-// Predict 1X2 from expected goals; if 1X2 is risky, prefer Over/Under 2.5; then BTTS.
-// Uses league-only last-5 form and competition standings. Render-ready.
+// server.js — AI Picks v5
+// Focus: opponent-adjusted last-5 form with home/away context and recency.
 
 import express from 'express';
 import dotenv from 'dotenv';
@@ -21,7 +20,6 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.disable('x-powered-by');
 
-// ---- Time helpers
 function fmtYMD(d, tz = TZ) {
   const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
   return f.format(d);
@@ -43,7 +41,6 @@ function toLocalLabel(iso, tz = TZ) {
 }
 function normTeam(s=''){ return s.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); }
 
-// ---- Aliases for official -> canonical names
 const ALIAS = new Map([
   ['paris saint germain','psg'], ['paris saint germain fc','psg'],
   ['manchester city fc','manchester city'], ['manchester united fc','manchester united'],
@@ -60,21 +57,18 @@ function canonicalKey(name){
   return n;
 }
 
-// ---- Seeds (Elo-like); others default to 1500
 const SEED_ELO = {
   'psg':1850,'paris saint germain':1850,
   'real madrid':1850,'barcelona':1820,'manchester city':1880,'liverpool':1820,'arsenal':1800,
   'chelsea':1750,'manchester united':1760,'bayern munich':1900,'inter':1820,'juventus':1800,
   'milan':1780,'atletico madrid':1800,'napoli':1780,'roma':1740,'tottenham':1760,
-  'galatasaray':1700,'fenerbahce':1680,'besiktas':1650,'trabzonspor':1620,
-  'nantes':1600
+  'galatasaray':1700,'fenerbahce':1680,'besiktas':1650,'trabzonspor':1620,'nantes':1600
 };
 function seedOf(name){
   const key = canonicalKey(name);
   return SEED_ELO[key] ?? SEED_ELO[normTeam(name)] ?? 1500;
 }
 
-// ---- League goal baselines
 function leagueBaseGpm(league=''){
   const k = (league||'').toLowerCase();
   if (k.includes('super lig') || k.includes('süper lig')) return 2.7;
@@ -88,7 +82,6 @@ function leagueBaseGpm(league=''){
   return 2.65;
 }
 
-// ---- HTTP helper
 const H = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' };
 async function getJson(url){
   const res = await fetch(url, { headers: H });
@@ -96,24 +89,22 @@ async function getJson(url){
   try { return JSON.parse(txt); } catch { return { raw: txt }; }
 }
 
-// ---- Standings cache
 const standingsCache = new Map();
-async function getStandingsMap(compId){
+async function getStandings(compId){
   if (standingsCache.has(compId)) return standingsCache.get(compId);
   try {
     const j = await getJson(`https://api.football-data.org/v4/competitions/${compId}/standings`);
-    const table = (j?.standings||[]).find(s => s.type === 'TOTAL')?.table || [];
+    const total = (j?.standings||[]).find(s => s.type === 'TOTAL');
+    const table = total?.table || [];
     const map = new Map();
-    for (const row of table) {
-      if (row.team?.id) map.set(row.team.id, row.position || 0);
-    }
-    standingsCache.set(compId, map);
-    return map;
-  } catch { return new Map(); }
+    for (const row of table) if (row.team?.id) map.set(row.team.id, row.position || 0);
+    const pack = { table, map, size: table.length || 20 };
+    standingsCache.set(compId, pack);
+    return pack;
+  } catch { return { table: [], map: new Map(), size: 20 }; }
 }
 
-// ---- Last 5 *league* matches
-const formCache = new Map(); // `${teamId}:${compId}`
+const formCache = new Map();
 async function getLastLeagueMatches(teamId, compId){
   const key = `${teamId}:${compId}`;
   if (formCache.has(key)) return formCache.get(key);
@@ -131,32 +122,42 @@ async function getLastLeagueMatches(teamId, compId){
   return last5;
 }
 
-function formStats(teamId, matches, standingsMap){
-  let pts=0, gf=0, ga=0, homeGF=0, homeGA=0, awayGF=0, awayGA=0, oppPosSum=0, oppCount=0;
-  for (const m of matches){
+function matchPoints(forGoals, agGoals){ if (forGoals>agGoals) return 3; if (forGoals===agGoals) return 1; return 0; }
+
+function formStatsAdvanced(teamId, matches, standingsPack){
+  const size = standingsPack.size || 20;
+  const posMap = standingsPack.map || new Map();
+  const REC = [1.00, 0.92, 0.85, 0.78, 0.72];
+  let pts=0, gf=0, ga=0, oppAvg=0, oppCnt=0, adjScore=0;
+  const details = [];
+  matches.forEach((m, idx) => {
     const isHome = m.homeTeam?.id === teamId;
     const ts = m.score?.fullTime || m.score?.regularTime || {};
     const h = ts.home ?? 0, a = ts.away ?? 0;
     const forGoals = isHome ? h : a;
     const agGoals = isHome ? a : h;
-    gf += forGoals; ga += agGoals;
-    if (isHome) { homeGF += h; homeGA += a; } else { awayGF += a; awayGA += h; }
-    if (forGoals > agGoals) pts += 3; else if (forGoals === agGoals) pts += 1;
+    const ptsThis = matchPoints(forGoals, agGoals);
     const oppId = isHome ? m.awayTeam?.id : m.homeTeam?.id;
-    if (oppId && standingsMap?.has(oppId)) { oppPosSum += standingsMap.get(oppId); oppCount += 1; }
-  }
+    const oppPos = oppId ? (posMap.get(oppId) || Math.ceil(size/2)) : Math.ceil(size/2);
+    const norm = (size - oppPos) / size - 0.5;
+    const OPP_K = 0.8;
+    const oppFactor = 1 + norm * OPP_K; // ~ [0.6, 1.4]
+    const venueFactor = isHome ? 1.00 : 1.15;
+    const w = REC[idx] ?? 0.7;
+    const score = ptsThis * oppFactor * venueFactor * w;
+    adjScore += score;
+    pts += ptsThis; gf += forGoals; ga += agGoals; oppAvg += oppPos; oppCnt += 1;
+    details.push({ isHome, forGoals, agGoals, ptsThis, oppPos, oppFactor:+oppFactor.toFixed(3), venueFactor, recency:w, contrib:+score.toFixed(3)});
+  });
   const gPlayed = matches.length || 1;
   const ppm = pts / gPlayed;
-  const gfpm = gf / gPlayed, gapm = ga / gPlayed;
-  const homeGP = matches.filter(m => m.homeTeam?.id === teamId).length || 1;
-  const awayGP = gPlayed - homeGP || 1;
-  const homeGFpm = homeGF / homeGP, homeGApm = homeGA / homeGP;
-  const awayGFpm = awayGF / awayGP, awayGApm = awayGA / awayGP;
-  const oppAvgPos = oppCount ? (oppPosSum / oppCount) : 10;
-  return { ppm, gfpm, gapm, homeGFpm, homeGApm, awayGFpm, awayGApm, oppAvgPos, gPlayed };
+  const gfpm = gf / gPlayed;
+  const gapm = ga / gPlayed;
+  const oppAvgPos = oppCnt ? (oppAvg/oppCnt) : Math.ceil(size/2);
+  const formStrength = adjScore / 12.0;
+  return { ppm, gfpm, gapm, oppAvgPos, formStrength, details };
 }
 
-// ---- Poisson tools
 function fac(n){ let r=1; for(let i=2;i<=n;i++) r*=i; return r; }
 function poisPmf(lam, k){ return Math.exp(-lam) * Math.pow(lam, k) / fac(k); }
 function poisCdf(lam, k){ let s=0; for(let i=0;i<=k;i++) s += poisPmf(lam,i); return s; }
@@ -172,64 +173,46 @@ function probs1X2(lh, la, cap=12){
   const s = pH+pD+pA || 1; return { pH: pH/s, pD: pD/s, pA: pA/s };
 }
 
-// ---- Expected goals + home favorite bias when seeds differ a lot
 function expectedGoalsAdvanced(homeName, awayName, leagueName, homeForm, awayForm){
   const baseG = leagueBaseGpm(leagueName);
-  const HOME_ELO = 70;
+  const HOME_ELO = 65;
   const rh = seedOf(homeName);
   const ra = seedOf(awayName);
   const seedDiff = (rh + HOME_ELO) - ra;
-
-  const posFactor = pos => Math.max(0.8, Math.min(1.2, 1 + (10 - pos)*0.02));
-  const homeOpp = posFactor(homeForm.oppAvgPos);
-  const awayOpp = posFactor(awayForm.oppAvgPos);
-
-  const homeAtk = 0.6*homeForm.homeGFpm + 0.4*homeForm.gfpm;
-  const awayAtk = 0.6*awayForm.awayGFpm + 0.4*awayForm.gfpm;
-  const homeDef = 0.6*homeForm.homeGApm + 0.4*homeForm.gapm;
-  const awayDef = 0.6*awayForm.awayGApm + 0.4*awayForm.gapm;
-
+  const fToFactor = f => Math.max(0.85, Math.min(1.15, 0.98 + 0.10 * f));
+  const homeFormFac = fToFactor(homeForm.formStrength);
+  const awayFormFac = fToFactor(awayForm.formStrength);
   let split = 0.5 + 0.12*Math.tanh(seedDiff/650);
-  const atkBias = (homeAtk/(homeDef+0.1)) / ((awayAtk/(awayDef+0.1))+0.01);
-  split = Math.max(0.36, Math.min(0.64, split * Math.pow(atkBias, 0.12)));
-
-  let lh = baseG * split * (1 + seedDiff/2200) * homeOpp * (homeAtk+0.8)/(awayDef+0.8);
-  let la = baseG * (1 - split) * (1 - seedDiff/2200) * awayOpp * (awayAtk+0.8)/(homeDef+0.8);
-
-  if (seedOf(homeName) - seedOf(awayName) >= 200) { lh *= 1.10; la *= 0.90; }
-
+  const relForm = (homeFormFac)/(awayFormFac+1e-9);
+  split = Math.max(0.36, Math.min(0.64, split * Math.pow(relForm, 0.25)));
+  let lh = baseG * split * (1 + seedDiff/2200) * homeFormFac;
+  let la = baseG * (1 - split) * (1 - seedDiff/2200) * awayFormFac;
+  if (seedOf(homeName) - seedOf(awayName) >= 200) { lh *= 1.08; la *= 0.92; }
   lh = Math.max(0.15, Math.min(3.2, lh));
   la = Math.max(0.15, Math.min(3.2, la));
-  return { lh, la, seedDiff, rh, ra, baseG, homeAtk, awayAtk, homeDef, awayDef };
+  return { lh, la, seedDiff, homeFormFac:+homeFormFac.toFixed(3), awayFormFac:+awayFormFac.toFixed(3) };
 }
 
-// ---- Decision: prefer totals if 1X2 is risky; then BTTS
 function decidePick(lh, la){
   const { pH, pD, pA } = probs1X2(lh, la);
   const best1x2 = [{label:'1',p:pH},{label:'X',p:pD},{label:'2',p:pA}].sort((a,b)=>b.p-a.p)[0];
-
   const totLam = lh + la;
   const pU25 = poisCdf(totLam, 2);
   const pO25 = 1 - pU25;
   const pBTTS = 1 - (Math.exp(-lh) + Math.exp(-la) - Math.exp(-lh-la));
   const bestBTTS = pBTTS >= 0.5 ? { market:'BTTS', label:'Yes', prob:pBTTS } : { market:'BTTS', label:'No', prob:1-pBTTS };
-
-  const oneX2Risky = best1x2.p < 0.60;
-  if (oneX2Risky) {
-    const bestTotals = pO25 >= pU25
-      ? { market:'Over/Under 2.5', label:'Over 2.5', prob:pO25 }
-      : { market:'Over/Under 2.5', label:'Under 2.5', prob:pU25 };
-    if (bestTotals.prob >= 0.60) return bestTotals;
-    if (bestBTTS.prob >= 0.58) return bestBTTS;
-  }
+  if (best1x2.p >= 0.60) return { market:'1X2', label:best1x2.label, prob:best1x2.p };
+  const bestTotals = pO25 >= pU25
+    ? { market:'Over/Under 2.5', label:'Over 2.5', prob:pO25 }
+    : { market:'Over/Under 2.5', label:'Under 2.5', prob:pU25 };
+  if (bestTotals.prob >= 0.60) return bestTotals;
+  if (bestBTTS.prob >= 0.58) return bestBTTS;
   return { market:'1X2', label:best1x2.label, prob:best1x2.p };
 }
 
-// ---- Fixtures pipeline
 async function fetchFixturesToday(withExplain=false){
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
-
   const now = new Date();
   const startUtc = now.toISOString().split('T')[0];
   const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
@@ -237,7 +220,6 @@ async function fetchFixturesToday(withExplain=false){
   const url = `https://api.football-data.org/v4/matches?dateFrom=${startUtc}&dateTo=${endUtc}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
   const j = await getJson(url);
   const arr = Array.isArray(j?.matches) ? j.matches : [];
-
   const rows = [];
   for (const f of arr){
     const league = `${f.competition?.area?.name || ''} ${f.competition?.name || ''}`.trim();
@@ -245,28 +227,25 @@ async function fetchFixturesToday(withExplain=false){
     const kickoffIso = f.utcDate;
     const hourLocal = localParts(kickoffIso).hh;
     if (!(hourLocal >= START_HOUR && hourLocal < END_HOUR)) continue;
-
     const homeName = f.homeTeam?.name || '';
     const awayName = f.awayTeam?.name || '';
     const homeId = f.homeTeam?.id;
     const awayId = f.awayTeam?.id;
-
     let pred = { market:'1X2', label:'1', prob:0.4 };
     let dbg = null;
     try {
-      const standings = compId ? await getStandingsMap(compId) : new Map();
+      const standingsPack = compId ? await getStandings(compId) : { map:new Map(), size:20 };
       const homeMatches = homeId ? await getLastLeagueMatches(homeId, compId) : [];
       const awayMatches = awayId ? await getLastLeagueMatches(awayId, compId) : [];
-      const homeForm = formStats(homeId, homeMatches, standings);
-      const awayForm = formStats(awayId, awayMatches, standings);
+      const homeForm = formStatsAdvanced(homeId, homeMatches, standingsPack);
+      const awayForm = formStatsAdvanced(awayId, awayMatches, standingsPack);
       const eg = expectedGoalsAdvanced(homeName, awayName, league, homeForm, awayForm);
       pred = decidePick(eg.lh, eg.la);
       if (withExplain) {
         const { pH, pD, pA } = probs1X2(eg.lh, eg.la);
-        dbg = { seeds:{home:seedOf(homeName),away:seedOf(awayName)}, eg, p1x2:{pH,pD,pA} };
+        dbg = { seeds:{home:seedOf(homeName),away:seedOf(awayName)}, form:{home:homeForm, away:awayForm}, eg, p1x2:{pH,pD,pA} };
       }
     } catch (e) {}
-
     const row = {
       league, kickoffIso, kickoff: toLocalLabel(kickoffIso),
       hourLocal, home: homeName, away: awayName,
@@ -275,19 +254,13 @@ async function fetchFixturesToday(withExplain=false){
     if (withExplain) row._explain = dbg;
     rows.push(row);
   }
-
   rows.sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
   if (!rows.length && FALLBACK_DEMO) {
-    rows.push({
-      league: 'Demo League', kickoff: `${date} 19:00`,
-      hourLocal: 19, home: 'Alpha FC', away: 'Beta United',
-      prediction: '1X2: 1 (61%)'
-    });
+    rows.push({ league: 'Demo League', kickoff: `${date} 19:00`, hourLocal: 19, home: 'Alpha FC', away: 'Beta United', prediction: '1X2: 1 (61%)' });
   }
   return { date, rows, totalFromApi: arr.length, apiUrl: url };
 }
 
-// ---- Cache & schedule
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
   try { CACHE = { ...(await fetchFixturesToday()), savedAt: new Date().toISOString() }; }
@@ -295,7 +268,6 @@ async function warmCache() {
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---- Routes
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -303,31 +275,26 @@ app.get('/api/today', async (_req, res) => {
 });
 app.get('/diag', async (_req, res) => {
   const fresh = await fetchFixturesToday(false);
-  res.json({
-    tz: TZ, startHour: START_HOUR, url: fresh.apiUrl,
-    totalFromApi: fresh.totalFromApi, cacheRows: CACHE.rows?.length || 0,
-    cacheDate: CACHE.date, savedAt: CACHE.savedAt
-  });
+  res.json({ tz: TZ, startHour: START_HOUR, url: fresh.apiUrl, totalFromApi: fresh.totalFromApi, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, savedAt: CACHE.savedAt });
 });
 app.get('/explain', async (_req, res) => {
   const fresh = await fetchFixturesToday(true);
   res.json(fresh);
 });
 
-// ---- UI
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today's Matches — AI Picks v4.1</title>
+  <title>Today's Matches — AI Picks v5</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-6xl mx-auto p-4 space-y-3">
     <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v4.1</h1>
+      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v5</h1>
       <div class="space-x-3 text-xs">
         <a href="/diag" class="underline opacity-70 hover:opacity-100">Diag</a>
         <a href="/explain" class="underline opacity-70 hover:opacity-100">Explain</a>
@@ -345,7 +312,7 @@ const INDEX_HTML = `<!doctype html>
         <tbody id="rows"></tbody>
       </table>
     </div>
-    <p class="text-[12px] text-slate-500">Heuristic only. Aliases fixed (e.g. Paris Saint-Germain → PSG seed). Try /explain for details.</p>
+    <p class="text-[12px] text-slate-500">Opponent-adjusted form: result × opponent strength × venue × recency. Heuristic only.</p>
   </div>
   <script>
     async function load(){
