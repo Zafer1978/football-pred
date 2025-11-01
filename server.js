@@ -1,10 +1,9 @@
-// server.js — Football-Data.org fixtures + local AI (1/X/2) predictions
-// Render-ready: binds 0.0.0.0:$PORT, daily refresh, time-window filter, Tailwind UI.
+// server.js — AI Picks v2: 1X/2 + Goals (O2.5/U2.5, BTTS, Home O1.5) with probabilities
+// Fetch fixtures from Football-Data.org; predict locally (no external prediction API).
+// Render-ready (0.0.0.0:$PORT), Istanbul timezone filtering, midnight refresh.
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
-import fs from 'fs';
-import path from 'path';
 
 dotenv.config();
 
@@ -17,15 +16,11 @@ const START_HOUR = parseInt(process.env.START_HOUR || '11', 10);
 const END_HOUR = 24;
 const FALLBACK_DEMO = process.env.FALLBACK_DEMO === '1';
 
-// Optional local ratings file (if present). Not required.
-const DATA_DIR = path.join(process.cwd(), 'data');
-const RATINGS_FILE = path.join(DATA_DIR, 'ratings.json');
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.disable('x-powered-by');
 
-// ---------- Time helpers ----------
+// ---- time helpers
 function fmtYMD(d, tz = TZ) {
   const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
   return f.format(d);
@@ -45,12 +40,9 @@ function toLocalLabel(iso, tz = TZ) {
   const pad = n => String(n).padStart(2, '0');
   return `${y}-${pad(m)}-${pad(d)} ${pad(hh)}:${pad(mm)}`;
 }
+function normTeam(s=''){ return s.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); }
 
-// ---------- Ratings + AI predictor ----------
-function normTeam(s = '') { return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
-
-// Built-in seed strengths for popular clubs.
-// Teams not listed default to 1500 Elo.
+// ---- seed strengths (Elo-like). Unlisted default to 1500.
 const SEED_ELO = {
   'real madrid':1850,'barcelona':1820,'manchester city':1880,'liverpool':1820,'arsenal':1800,
   'chelsea':1750,'manchester united':1760,'bayern munich':1900,'inter':1820,'juventus':1800,
@@ -58,45 +50,113 @@ const SEED_ELO = {
   'galatasaray':1700,'fenerbahce':1680,'besiktas':1650,'trabzonspor':1620
 };
 
-// If ratings.json exists, merge/override seeds.
-function loadRatings() {
-  const elo = { ...SEED_ELO };
-  try {
-    if (fs.existsSync(RATINGS_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(RATINGS_FILE, 'utf-8'));
-      const teams = raw?.teams || {};
-      for (const [name, obj] of Object.entries(teams)) {
-        const key = normTeam(name);
-        const val = typeof obj === 'number' ? obj : obj?.elo;
-        if (typeof val === 'number') elo[key] = val;
-      }
-      console.log(`[AI] Loaded ratings from data/ratings.json (${Object.keys(teams).length} teams)`);
-    } else {
-      console.log('[AI] Using built-in seed ratings');
+// ---- league baseline goals per match (heuristic)
+function leagueBaseGpm(league=''){
+  const k = (league||'').toLowerCase();
+  if (k.includes('super lig') || k.includes('süper lig')) return 2.7;
+  if (k.includes('premier')) return 2.9;
+  if (k.includes('la liga')) return 2.6;
+  if (k.includes('bundesliga')) return 3.1;
+  if (k.includes('serie a')) return 2.5;
+  if (k.includes('ligue 1')) return 2.7;
+  if (k.includes('eredivisie')) return 3.0;
+  if (k.includes('primeira')) return 2.5;
+  return 2.65; // default global
+}
+
+// ---- Poisson helpers
+function fac(n){ let r=1; for(let i=2;i<=n;i++) r*=i; return r; }
+function poisPmf(lam, k){ return Math.exp(-lam) * Math.pow(lam, k) / fac(k); }
+function poisCdf(lam, k){ // P(X<=k)
+  let s=0; for(let i=0;i<=k;i++) s += poisPmf(lam,i); return s;
+}
+
+// ---- probability grid for 1X2 via truncated Poisson convolution
+function probs1X2(lh, la, cap=10){
+  let pH=0, pD=0, pA=0;
+  for(let i=0;i<=cap;i++){
+    const ph = poisPmf(lh, i);
+    for(let j=0;j<=cap;j++){
+      const pa = poisPmf(la, j);
+      if (i>j) pH += ph*pa;
+      else if (i===j) pD += ph*pa;
+      else pA += ph*pa;
     }
-  } catch (e) {
-    console.log('[AI] Failed to load ratings.json, using seeds. Error:', e?.message || e);
   }
-  return elo;
-}
-let RATINGS = loadRatings();
-
-function predict1X2(home, away) {
-  const base = 1500, HOME_ADV = 80;
-  const rh = RATINGS[normTeam(home)] ?? base;
-  const ra = RATINGS[normTeam(away)] ?? base;
-  const diff = (rh + HOME_ADV) - ra;
-  const pHome = 1/(1+Math.pow(10,-diff/400));
-  const pAway = 1 - pHome;
-  const pDraw = 0.25 * Math.exp(-Math.abs(diff)/600);
-  const sum = pHome + pAway + pDraw;
-  const ph = pHome/sum, pa = pAway/sum, pd = pDraw/sum;
-  if (pd >= ph && pd >= pa) return 'X';
-  if (pa > ph) return '2';
-  return '1';
+  // small tail correction (mass above cap) is ignored, acceptable for cap=10..12
+  const s = pH+pD+pA || 1;
+  return { pH: pH/s, pD: pD/s, pA: pA/s };
 }
 
-// ---------- API fetch ----------
+// ---- expected goals model (simple, calibrated)
+function expectedGoals(home, away, leagueName=''){
+  const baseG = leagueBaseGpm(leagueName); // total expected goals
+  const HOME_ADV_ELO = 60; // reduced so 1 is not over-picked
+  const SCALE = 700;       // higher scale -> softer influence from Elo diff
+  const rh = SEED_ELO[normTeam(home)] ?? 1500;
+  const ra = SEED_ELO[normTeam(away)] ?? 1500;
+  const diff = (rh + HOME_ADV_ELO) - ra; // home edge
+
+  // Split base goals into home/away shares biased by strength difference
+  // logistic split in [0.35, 0.65]
+  const split = 0.5 + 0.15 * Math.tanh(diff / SCALE);
+  const lambdaHome = Math.max(0.2, baseG * split);
+  const lambdaAway = Math.max(0.2, baseG * (1 - split));
+  return { lambdaHome, lambdaAway, baseG, rh, ra, diff };
+}
+
+// ---- build best market
+function bestMarket(home, away, league){
+  const { lambdaHome: lh, lambdaAway: la } = expectedGoals(home, away, league);
+  const cap = 12;
+
+  // 1X2
+  const { pH, pD, pA } = probs1X2(lh, la, cap);
+  const oneXtwo = [
+    { market: '1X2', label: '1', prob: pH },
+    { market: '1X2', label: 'X', prob: pD },
+    { market: '1X2', label: '2', prob: pA },
+  ];
+
+  // Totals (Over/Under 2.5) using total lambda
+  const lt = lh + la;
+  const pUnder25 = poisCdf(lt, 2);
+  const pOver25 = 1 - pUnder25;
+
+  const totals = [
+    { market: 'Over/Under 2.5', label: 'Over 2.5', prob: pOver25 },
+    { market: 'Over/Under 2.5', label: 'Under 2.5', prob: pUnder25 }
+  ];
+
+  // BTTS
+  const pH0 = Math.exp(-lh);
+  const pA0 = Math.exp(-la);
+  const pBTTSno = pH0 + pA0 - pH0*pA0;
+  const pBTTSyes = 1 - pBTTSno;
+  const btts = [
+    { market: 'BTTS', label: 'Yes', prob: pBTTSyes },
+    { market: 'BTTS', label: 'No',  prob: pBTTSno  },
+  ];
+
+  // Home Over 1.5
+  const pHomeOver15 = 1 - poisCdf(lh, 1);
+  const home15 = [{ market: 'Home over 1.5', label: 'Home Over 1.5', prob: pHomeOver15 }];
+
+  // Choose
+  const GOALS_PREF = 0.62; // prefer goals bet if >= 62%
+  const all = [...oneXtwo, ...totals, ...btts, ...home15];
+  const best = all.reduce((a,b)=> (b.prob>a.prob?b:a));
+
+  // If a goals market is confident enough, prefer it over 1X2
+  const bestGoals = [...totals, ...btts, ...home15].reduce((a,b)=> (b.prob>a.prob?b:a));
+  const best1x2 = oneXtwo.reduce((a,b)=> (b.prob>a.prob?b:a));
+  if (bestGoals.prob >= GOALS_PREF && bestGoals.prob >= best1x2.prob - 0.03) {
+    return bestGoals;
+  }
+  return best;
+}
+
+// ---- fetch fixtures
 async function fetchJson(url, headers) {
   const res = await fetch(url, { headers });
   const txt = await res.text();
@@ -107,7 +167,6 @@ async function getTodayFixturesFiltered() {
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
 
-  // Query a precise 1-day UTC window to represent "today"
   const now = new Date();
   const startUtc = now.toISOString().split('T')[0];
   const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
@@ -119,30 +178,30 @@ async function getTodayFixturesFiltered() {
   const arr = Array.isArray(json?.matches) ? json.matches : [];
 
   let rows = arr.map(f => {
+    const league = `${f.competition?.area?.name || ''} ${f.competition?.name || ''}`.trim();
     const home = f.homeTeam?.name || '';
     const away = f.awayTeam?.name || '';
-    const prediction = predict1X2(home, away);
+    const pick = bestMarket(home, away, league);
     return {
-      league: `${f.competition?.area?.name || ''} ${f.competition?.name || ''}`.trim(),
+      league,
       kickoffIso: f.utcDate,
       kickoff: toLocalLabel(f.utcDate),
       hourLocal: localParts(f.utcDate).hh,
       home, away,
-      prediction
+      prediction: `${pick.market}: ${pick.label} (${Math.round(pick.prob*100)}%)`
     };
   }).filter(r => r.hourLocal >= START_HOUR && r.hourLocal < END_HOUR)
     .sort((a,b) => (a.kickoff || '').localeCompare(b.kickoff || ''));
 
   if (!rows.length && FALLBACK_DEMO) {
-    rows = [
-      { league: 'Demo League', kickoff: `${date} 15:00`, home: 'Alpha FC', away: 'Beta United', prediction: '1' },
-      { league: 'Demo League', kickoff: `${date} 18:30`, home: 'Gamma City', away: 'Delta Town', prediction: 'X' }
-    ];
+    const d = `${date} 19:00`;
+    const p = bestMarket('Alpha FC','Beta United','Demo League');
+    rows = [{ league:'Demo League', kickoff:d, home:'Alpha FC', away:'Beta United', prediction:`${p.market}: ${p.label} (${Math.round(p.prob*100)}%)` }];
   }
   return { date, rows, totalFromApi: arr.length, apiUrl: url };
 }
 
-// ---------- Cache & schedule ----------
+// ---- cache & schedule
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
   try {
@@ -152,10 +211,9 @@ async function warmCache() {
     CACHE = { date: todayYMD(), rows: [], savedAt: new Date().toISOString(), error: String(e.message || e) };
   }
 }
-// nightly refresh at 00:01 in Istanbul
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---------- Routes ----------
+// ---- routes
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -163,16 +221,11 @@ app.get('/api/today', async (_req, res) => {
 });
 
 app.get('/diag', async (_req, res) => {
-  // Fetch fresh once to reveal URL/total in diagnostics (non-cached)
   const fresh = await getTodayFixturesFiltered();
   res.json({
-    tz: TZ,
-    startHour: START_HOUR,
-    url: fresh.apiUrl,
-    totalFromApi: fresh.totalFromApi,
-    cacheRows: CACHE.rows?.length || 0,
-    cacheDate: CACHE.date,
-    savedAt: CACHE.savedAt
+    tz: TZ, startHour: START_HOUR, url: fresh.apiUrl,
+    totalFromApi: fresh.totalFromApi, cacheRows: CACHE.rows?.length || 0,
+    cacheDate: CACHE.date, savedAt: CACHE.savedAt
   });
 });
 
@@ -181,14 +234,14 @@ const INDEX_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today's Matches — AI Picks</title>
+  <title>Today's Matches — AI Picks v2</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-6xl mx-auto p-4 space-y-3">
     <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks</h1>
+      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v2</h1>
       <a href="/diag" class="text-xs underline opacity-70 hover:opacity-100">Diagnostics</a>
     </header>
     <div class="overflow-x-auto bg-white rounded-2xl shadow">
