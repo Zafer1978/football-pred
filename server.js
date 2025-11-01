@@ -1,4 +1,4 @@
-// server.js — Show only matches between 11:00–24:00 (GMT+3 / Europe/Istanbul) and refresh cache at midnight (fixed title apostrophe)
+// server.js — using Football-Data.org API (free) for fixtures
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -8,9 +8,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TZ = process.env.TZ || 'Europe/Istanbul';
-const API_KEY = process.env.API_FOOTBALL_KEY || '';
+const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const START_HOUR = parseInt(process.env.START_HOUR || '11', 10);
 const END_HOUR = 24;
+const FALLBACK_DEMO = process.env.FALLBACK_DEMO === '1';
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -39,10 +40,6 @@ function toLocalLabel(iso, tz = TZ) {
 async function fetchJson(url, headers) {
   const res = await fetch(url, { headers });
   const txt = await res.text();
-  if (!res.ok) {
-    const err = new Error('HTTP ' + res.status);
-    err.status = res.status; err.body = txt; throw err;
-  }
   try { return JSON.parse(txt); } catch { return { raw: txt }; }
 }
 
@@ -50,31 +47,34 @@ async function getTodayFixturesFiltered() {
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
 
-  const base = 'https://v3.football.api-sports.io/fixtures';
-  const url = `${base}?date=${date}&timezone=${encodeURIComponent(TZ)}`;
-  const headers = { 'x-apisports-key': API_KEY, 'accept': 'application/json' };
+  const url = 'https://api.football-data.org/v4/matches';
+  const headers = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' };
 
   const json = await fetchJson(url, headers);
-  const arr = Array.isArray(json?.response) ? json.response : [];
+  const arr = Array.isArray(json?.matches) ? json.matches : [];
 
-  const rows = arr.map(f => ({
-    league: `${f.league?.country || ''} ${f.league?.name || ''}`.trim(),
-    kickoffIso: f.fixture?.date,
-    kickoff: toLocalLabel(f.fixture?.date),
-    hourLocal: localParts(f.fixture?.date).hh,
-    home: f.teams?.home?.name || '',
-    away: f.teams?.away?.name || '',
-    prediction: '',
-    confidence: ''
+  let rows = arr.map(f => ({
+    league: `${f.competition?.area?.name || ''} ${f.competition?.name || ''}`.trim(),
+    kickoffIso: f.utcDate,
+    kickoff: toLocalLabel(f.utcDate),
+    hourLocal: localParts(f.utcDate).hh,
+    home: f.homeTeam?.name || '',
+    away: f.awayTeam?.name || '',
   })).filter(r => r.hourLocal >= START_HOUR && r.hourLocal < END_HOUR)
     .sort((a,b) => (a.kickoff || '').localeCompare(b.kickoff || ''));
 
-  return { date, rows };
+  if (!rows.length && FALLBACK_DEMO) {
+    rows = [
+      { league: 'Demo League', kickoff: `${date} 15:00`, home: 'Alpha FC', away: 'Beta United' },
+      { league: 'Demo League', kickoff: `${date} 18:30`, home: 'Gamma City', away: 'Delta Town' }
+    ];
+  }
+  return { date, rows, totalFromApi: arr.length };
 }
 
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
-  const res = await getTodayFixturesFiltered().catch(e => ({ date: todayYMD(), rows: [], reason: 'fetch_error', error: String(e.message || e), status: e.status, bodyHead: (e.body || '').slice(0,200) }));
+  const res = await getTodayFixturesFiltered();
   CACHE = { ...res, savedAt: new Date().toISOString() };
   return CACHE;
 }
@@ -88,19 +88,17 @@ app.get('/api/today', async (_req, res) => {
 });
 
 app.get('/diag', async (_req, res) => {
-  const date = todayYMD();
-  const base = 'https://v3.football.api-sports.io/fixtures';
-  const url = `${base}?date=${date}&timezone=${encodeURIComponent(TZ)}`;
-  const headers = { 'x-apisports-key': API_KEY || '', 'accept': 'application/json' };
+  const url = 'https://api.football-data.org/v4/matches';
+  const headers = { 'X-Auth-Token': API_KEY || '', 'accept': 'application/json' };
   try {
     const r = await fetch(url, { headers });
     const status = r.status;
     const body = await r.text();
     let count = 0;
-    try { const j = JSON.parse(body); count = Array.isArray(j?.response) ? j.response.length : 0; } catch {}
-    res.json({ date, tz: TZ, startHour: START_HOUR, url, status, totalFromApi: count, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, bodyHead: body.slice(0, 300) });
+    try { const j = JSON.parse(body); count = Array.isArray(j?.matches) ? j.matches.length : 0; } catch {}
+    res.json({ tz: TZ, startHour: START_HOUR, url, status, totalFromApi: count, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, bodyHead: body.slice(0, 300) });
   } catch (e) {
-    res.json({ date, tz: TZ, startHour: START_HOUR, url, error: String(e.message || e) });
+    res.json({ tz: TZ, startHour: START_HOUR, url, error: String(e.message || e) });
   }
 });
 
@@ -110,15 +108,15 @@ const INDEX_HTML =
 '<head>\n'+
 '  <meta charset="utf-8" />\n'+
 '  <meta name="viewport" content="width=device-width, initial-scale=1" />\n'+
-'  <title>Today&#39;s Matches (11:00–24:00 TRT)</title>\n'+
+'  <title>Today&#39;s Fixtures (Football-Data.org)</title>\n'+
 '  <script src="https://cdn.tailwindcss.com"></script>\n'+
 '  <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>\n'+
 '</head>\n'+
 '<body class="bg-slate-50 text-slate-900">\n'+
-'  <div class="max-w-6xl mx-auto p-4">\n'+
-'    <header class="mb-4 flex items-center justify-between">\n'+
-'      <h1 class="text-2xl font-bold">Matches Today (from 11:00 TRT)</h1>\n'+
-'      <a href="/diag" class="text-sm underline">Diagnostics</a>\n'+
+'  <div class="max-w-6xl mx-auto p-4 space-y-3">\n'+
+'    <header class="flex items-center justify-between">\n'+
+'      <h1 class="text-2xl font-bold">Today&#39;s Matches (11:00–24:00 TRT)</h1>\n'+
+'      <a href="/diag" class="text-xs underline opacity-70 hover:opacity-100">Diagnostics</a>\n'+
 '    </header>\n'+
 '    <div class="overflow-x-auto bg-white rounded-2xl shadow">\n'+
 '      <table class="min-w-full text-sm" id="tbl">\n'+
