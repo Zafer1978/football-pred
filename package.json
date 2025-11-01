@@ -1,10 +1,14 @@
 {
-  "name": "football-matches-footballdata-datewindow",
-  "version": "1.0.3",
+  "name": "football-matches-footballdata-aipicks",
+  "version": "1.2.0",
   "type": "module",
   "main": "server.js",
-  "engines": { "node": "20.x" },
-  "scripts": { "start": "node server.js" },
+  "engines": {
+    "node": "20.x"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "dotenv": "^16.4.0",
     "express": "^4.18.2",
