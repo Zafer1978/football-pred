@@ -1,4 +1,4 @@
-// server.js — Football-Data.org, no escape bug, Render-ready
+// server.js — Football-Data.org with dateFrom/dateTo, Render-ready
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -48,7 +48,12 @@ async function getTodayFixturesFiltered() {
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
 
-  const url = 'https://api.football-data.org/v4/matches';
+  // dateFrom/dateTo for today's UTC window
+  const now = new Date();
+  const startUtc = now.toISOString().split('T')[0];
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const endUtc = end.toISOString().split('T')[0];
+  const url = `https://api.football-data.org/v4/matches?dateFrom=${startUtc}&dateTo=${endUtc}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
   const headers = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' };
 
   const json = await fetchJson(url, headers);
@@ -70,7 +75,7 @@ async function getTodayFixturesFiltered() {
       { league: 'Demo League', kickoff: `${date} 18:30`, home: 'Gamma City', away: 'Delta Town' }
     ];
   }
-  return { date, rows, totalFromApi: arr.length };
+  return { date, rows, totalFromApi: arr.length, apiUrl: url };
 }
 
 // In-memory cache
@@ -87,7 +92,6 @@ async function warmCache() {
 // Schedule nightly refresh 00:01
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// Routes
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -95,17 +99,11 @@ app.get('/api/today', async (_req, res) => {
 });
 
 app.get('/diag', async (_req, res) => {
-  const url = 'https://api.football-data.org/v4/matches';
-  const headers = { 'X-Auth-Token': API_KEY || '', 'accept': 'application/json' };
   try {
-    const r = await fetch(url, { headers });
-    const status = r.status;
-    const body = await r.text();
-    let count = 0;
-    try { const j = JSON.parse(body); count = Array.isArray(j?.matches) ? j.matches.length : 0; } catch {}
-    res.json({ tz: TZ, startHour: START_HOUR, url, status, totalFromApi: count, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, bodyHead: body.slice(0, 300) });
+    const { apiUrl } = await getTodayFixturesFiltered();
+    res.json({ tz: TZ, startHour: START_HOUR, url: apiUrl, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, savedAt: CACHE.savedAt });
   } catch (e) {
-    res.json({ tz: TZ, startHour: START_HOUR, url, error: String(e.message || e) });
+    res.json({ error: String(e.message || e) });
   }
 });
 
