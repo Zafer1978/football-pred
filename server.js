@@ -1,4 +1,4 @@
-// server.js — BetEstimate.com v5.2.6 (AI Picks + About/Privacy/Contact + Ad slots + Color-coded rows)
+// server.js — BetEstimate.com v5.2.7 (Sport Energy Theme)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -331,43 +331,55 @@ async function warmCache() {
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---------- Shared UI bits
+// ---------- Shared UI bits (Sport Energy Theme)
 const HEAD_META = `
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="BetEstimate.com — free daily AI football predictions and statistical match analysis: 1X2, Over/Under 2.5, BTTS. Updated automatically." />
   <meta name="keywords" content="AI football predictions, football betting tips, match probabilities, over under 2.5, BTTS, sports analytics, football data, daily picks, BetEstimate" />
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- AdSense global script goes here when approved:
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXX" crossorigin="anonymous"></script>
-  -->
   <style>
+    :root{
+      --bg: #f1f5f9;          /* slate-100 */
+      --nav: #1e3a8a;         /* navy */
+      --acc1:#84cc16;         /* lime-400 */
+      --acc2:#0ea5e9;         /* sky-500 */
+      --strong:#d9f99d;       /* lime-200 */
+      --medium:#e0f2fe;       /* sky-100 */
+      --low:#f8fafc;          /* slate-50 */
+    }
+    body{background: var(--bg);}
     thead.sticky th{position:sticky;top:0;z-index:10}
     th,td{vertical-align:middle}
-    tr.edge-strong { background: #ecfdf5; }
-    tr.edge-medium { background: #eff6ff; }
-    tr.edge-low    { background: #f8fafc; }
+    .nav-gradient{background: linear-gradient(90deg, var(--nav), #0c4a6e);}
+    .badge{background: linear-gradient(90deg, var(--acc1), var(--acc2)); -webkit-background-clip: text; background-clip: text; color: transparent;}
+    tr.edge-strong { background: var(--strong); }
+    tr.edge-medium { background: var(--medium); }
+    tr.edge-low    { background: var(--low); }
+    .accent-ring { box-shadow: 0 0 0 3px rgba(14,165,233,.15); }
   </style>
 `;
 
 function siteHeader(active='home'){
-  const link = (href, label, key) => `<a class="px-2 py-1 rounded ${active===key?'bg-slate-900 text-white':'hover:underline'}" href="${href}">${label}</a>`;
+  const link = (href, label, key) => `<a class="px-3 py-1.5 rounded text-white/90 hover:text-white" href="${href}">${label}</a>`;
   return `
-    <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">BetEstimate.com — Today’s AI Football Picks</h1>
+    <header class="rounded-2xl nav-gradient text-white p-4 flex items-center justify-between accent-ring">
+      <h1 class="text-xl sm:text-2xl font-extrabold tracking-tight">
+        BetEstimate<span class="badge">.com</span> — Today’s AI Football Picks
+      </h1>
       <nav class="text-sm space-x-2">
         ${link('/', 'Home', 'home')}
         ${link('/about', 'About', 'about')}
         ${link('/privacy', 'Privacy', 'privacy')}
         ${link('/contact', 'Contact', 'contact')}
-        <a href="/diag" class="opacity-70 hover:opacity-100">Diag</a>
+        <a href="/diag" class="px-3 py-1.5 rounded bg-white/10 hover:bg-white/15">Diag</a>
       </nav>
     </header>
   `;
 }
 
 const FOOTER = `
-  <footer class="mt-8 text-[12px] text-slate-600">
+  <footer class="mt-8 text-[12px] text-slate-700">
     <div class="italic">Use the data at your own risk. Informational picks only — no guarantees.</div>
     <div class="mt-2">© ${new Date().getFullYear()} BetEstimate.com</div>
   </footer>
@@ -396,12 +408,12 @@ app.get('/', (_req, res) => {
   <title>BetEstimate.com — Today’s AI Football Picks</title>
   ${HEAD_META}
 </head>
-<body class="bg-slate-50 text-slate-900">
+<body class="text-slate-900">
   <div class="max-w-7xl mx-auto p-4 space-y-4">
 
     <!-- Top banner ad -->
     <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-20">
-      <div class="text-center text-slate-500 text-xs">
+      <div class="text-center text-slate-600 text-xs">
         <div class="uppercase tracking-wide">Ad Space</div>
         <div>728×90 / 970×90</div>
       </div>
@@ -414,7 +426,7 @@ app.get('/', (_req, res) => {
       <!-- Left ad card -->
       <aside class="lg:col-span-2 space-y-4">
         <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-40">
-          <div class="text-center text-slate-500 text-xs">
+          <div class="text-center text-slate-600 text-xs">
             <div class="uppercase tracking-wide">Ad Space</div>
             <div>300×250 / 160×600</div>
           </div>
@@ -426,7 +438,7 @@ app.get('/', (_req, res) => {
         <div class="overflow-x-auto bg-white rounded-2xl shadow">
           <table class="min-w-full text-sm" id="tbl">
             <thead class="bg-slate-100 sticky">
-              <tr>
+              <tr class="text-slate-700">
                 <th class="text-left p-3">Kickoff</th>
                 <th class="text-left p-3">League</th>
                 <th class="text-left p-3">Home</th>
@@ -441,19 +453,19 @@ app.get('/', (_req, res) => {
 
         <!-- Inline rectangle ad -->
         <div class="mt-4 bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-24">
-          <div class="text-center text-slate-500 text-xs">
+          <div class="text-center text-slate-600 text-xs">
             <div class="uppercase tracking-wide">Ad Space</div>
             <div>468×60 / 320×100</div>
           </div>
         </div>
 
-        <div class="mt-3 text-[12px] text-slate-600">
-          <span class="inline-flex items-center mr-3">
-            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#ecfdf5"></span>
+        <div class="mt-3 text-[12px] text-slate-700 font-medium flex flex-wrap gap-4">
+          <span class="inline-flex items-center">
+            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#d9f99d"></span>
             Strong signal (edge ≥ 10)
           </span>
-          <span class="inline-flex items-center mr-3">
-            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#eff6ff"></span>
+          <span class="inline-flex items-center">
+            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#e0f2fe"></span>
             Medium signal (5–9)
           </span>
           <span class="inline-flex items-center">
@@ -468,7 +480,7 @@ app.get('/', (_req, res) => {
       <!-- Right ad card -->
       <aside class="lg:col-span-2 space-y-4">
         <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-40">
-          <div class="text-center text-slate-500 text-xs">
+          <div class="text-center text-slate-600 text-xs">
             <div class="uppercase tracking-wide">Ad Space</div>
             <div>300×250</div>
           </div>
@@ -517,7 +529,7 @@ app.get('/about', (_req, res) => {
   <title>About — BetEstimate.com</title>
   ${HEAD_META}
 </head>
-<body class="bg-slate-50 text-slate-900">
+<body class="text-slate-900">
   <div class="max-w-4xl mx-auto p-4 space-y-4">
     ${siteHeader('about')}
     <main class="bg-white rounded-2xl shadow p-6 space-y-3 text-sm leading-6">
@@ -541,7 +553,7 @@ app.get('/privacy', (_req, res) => {
   <title>Privacy — BetEstimate.com</title>
   ${HEAD_META}
 </head>
-<body class="bg-slate-50 text-slate-900">
+<body class="text-slate-900">
   <div class="max-w-4xl mx-auto p-4 space-y-4">
     ${siteHeader('privacy')}
     <main class="bg-white rounded-2xl shadow p-6 space-y-3 text-sm leading-6">
@@ -565,7 +577,7 @@ app.get('/contact', (_req, res) => {
   <title>Contact — BetEstimate.com</title>
   ${HEAD_META}
 </head>
-<body class="bg-slate-50 text-slate-900">
+<body class="text-slate-900">
   <div class="max-w-4xl mx-auto p-4 space-y-4">
     ${siteHeader('contact')}
     <main class="bg-white rounded-2xl shadow p-6 space-y-3 text-sm leading-6">
