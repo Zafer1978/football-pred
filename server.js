@@ -1,7 +1,4 @@
-// server.js — AI Picks v5.2.4
-// Fix diag bug: malformed dateTo in /matches URL. Now we compute dateFrom/dateTo
-// using LOCAL (Europe/Istanbul) calendar boundaries reliably (no ISO split glitches).
-
+// server.js — AI Picks v5.2.5 (Alt pick + row colors + ad slots)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -17,10 +14,10 @@ const START_HOUR = parseInt(process.env.START_HOUR || '11', 10);
 const END_HOUR = 24;
 const FALLBACK_DEMO = process.env.FALLBACK_DEMO === '1';
 
-// Calibration & selection
+// Calibration
 const SHARPEN_TAU_1X2 = parseFloat(process.env.SHARPEN_TAU_1X2 || '1.25');
 const STRONG_DIFF_TILT = parseFloat(process.env.STRONG_DIFF_TILT || '220');
-const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08');
+const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08'); // 8%
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -38,7 +35,6 @@ function addDaysLocalYMD(days=0, tz = TZ){
   return fmtYMD(base, tz); // YYYY-MM-DD in tz
 }
 function localStartEndISODate(tz = TZ){
-  // Return [dateFrom, dateToExclusive] as YYYY-MM-DD (LOCAL calendar), safe for Football-Data params
   const from = addDaysLocalYMD(0, tz);
   const to = addDaysLocalYMD(1, tz);
   return [from, to];
@@ -103,7 +99,7 @@ function leagueBaseGpm(league=''){
   return 2.65;
 }
 
-// ---------- HTTP helper (single)
+// ---------- HTTP helper
 const H = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' };
 async function getJson(url){
   const res = await fetch(url, { headers: H });
@@ -222,6 +218,7 @@ function expectedGoalsAdvanced(homeName, awayName, leagueName, homeForm, awayFor
   return { lh, la, seedDiff, homeFormFac:+homeFormFac.toFixed(3), awayFormFac:+awayFormFac.toFixed(3) };
 }
 
+// ---------- Strongest + runner up
 function chooseStrongest(lh, la){
   let { pH, pD, pA } = probs1X2(lh, la);
   ({ pH, pD, pA } = sharpen3(pH, pD, pA, SHARPEN_TAU_1X2));
@@ -240,22 +237,22 @@ function chooseStrongest(lh, la){
   const edgeBTTS = bestBTTS.p - 0.5;
 
   const candidates = [
-    { market:'1X2', label:best1.label, prob:best1.p, edge:edge1, base:0.33 },
-    { market:bestTot.market, label:bestTot.label, prob:bestTot.p, edge:edgeTot, base:0.50 },
-    { market:bestBTTS.market, label:bestBTTS.label, prob:bestBTTS.p, edge:edgeBTTS, base:0.50 },
+    { market:'1X2',               label:best1.label,   prob:best1.p,    edge:edge1,   base:0.33 },
+    { market:bestTot.market,      label:bestTot.label, prob:bestTot.p,  edge:edgeTot, base:0.50 },
+    { market:bestBTTS.market,     label:bestBTTS.label,prob:bestBTTS.p, edge:edgeBTTS,base:0.50 },
   ].sort((a,b)=> b.edge - a.edge);
 
   const top = candidates[0];
-  if (top.edge >= EDGE_MIN) return top;
-  return { market:'1X2', label:best1.label, prob:best1.p, edge:edge1, base:0.33, note:'low-edge-fallback' };
+  const second = candidates[1];
+  if (top.edge < EDGE_MIN) top.note = 'low-edge-fallback';
+  return { top, second, all: candidates };
 }
 
-// ---------- Fetch fixtures and build rows
+// ---------- Fetch fixtures
 async function fetchFixturesToday(withExplain=false){
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
 
-  // Use LOCAL calendar window [today, tomorrow) in Istanbul
   const [dateFrom, dateTo] = localStartEndISODate(TZ);
   const url = `https://api.football-data.org/v4/matches?dateFrom=${dateFrom}&dateTo=${dateTo}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
   const { status, json, txt } = await getJson(url);
@@ -274,7 +271,9 @@ async function fetchFixturesToday(withExplain=false){
     const homeId = f.homeTeam?.id;
     const awayId = f.awayTeam?.id;
 
-    let out = null;
+    let primary = 'N/A', alt = '';
+    let primaryEdgePct = 0, altEdgePct = 0;
+
     try {
       const standingsPack = compId ? await getStandings(compId) : { map:new Map(), size:20 };
       const homeMatches = homeId ? await getLastLeagueMatches(homeId, compId) : [];
@@ -282,24 +281,36 @@ async function fetchFixturesToday(withExplain=false){
       const homeForm = formStatsAdvanced(homeId, homeMatches, standingsPack);
       const awayForm = formStatsAdvanced(awayId, awayMatches, standingsPack);
       const eg = expectedGoalsAdvanced(homeName, awayName, league, homeForm, awayForm);
-      out = chooseStrongest(eg.lh, eg.la);
+      const choice = chooseStrongest(eg.lh, eg.la);
+
+      if (choice?.top) {
+        const p1 = Math.round(choice.top.prob * 100);
+        primaryEdgePct = Math.round(Math.max(0, choice.top.edge) * 100);
+        primary = `${choice.top.market}: ${choice.top.label} (${p1}%)`;
+      }
+      if (choice?.second) {
+        const p2 = Math.round(choice.second.prob * 100);
+        altEdgePct = Math.round(Math.max(0, choice.second.edge) * 100);
+        alt = `${choice.second.market}: ${choice.second.label} (${p2}%)`;
+      }
     } catch (e) {}
 
-    const pct = Math.round((out?.prob || 0) * 100);
-    const edgePct = Math.round(Math.max(0, (out?.edge || 0) * 100));
-    const row = {
+    rows.push({
       league, kickoffIso, kickoff: toLocalLabel(kickoffIso),
       hourLocal, home: homeName, away: awayName,
-      prediction: out ? `${out.market}: ${out.label} (${pct}%, +${edgePct} edge)` : 'N/A'
-    };
-    rows.push(row);
+      prediction: primary,
+      altPrediction: alt,
+      primaryEdgePct,
+      altEdgePct
+    });
   }
 
   rows.sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
   if (!rows.length && FALLBACK_DEMO) {
     rows.push({
       league: 'Demo League', kickoff: `${date} 19:00`, hourLocal: 19, home: 'Alpha FC', away: 'Beta United',
-      prediction: '1X2: 1 (64%, +31 edge)'
+      prediction: '1X2: 1 (64%)', altPrediction: 'Over/Under 2.5: Over 2.5 (58%)',
+      primaryEdgePct: 31, altEdgePct: 8
     });
   }
   return { date, rows, totalFromApi: arr.length, apiUrl: url, status, bodyHead: String(txt).slice(0,300) };
@@ -335,53 +346,135 @@ app.get('/explain', async (_req, res) => {
   res.json(fresh);
 });
 
-// ---------- UI
+// ---------- UI (with ad slots + color-coded rows)
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today's Matches — AI Picks v5.2.4</title>
+  <title>Today’s Matches — AI Picks</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
+  <style>
+    thead.sticky th{position:sticky;top:0;z-index:10}
+    th,td{vertical-align:middle}
+    /* Row colors by primaryEdgePct */
+    tr.edge-strong { background: #ecfdf5; }  /* green-50 */
+    tr.edge-medium { background: #eff6ff; }  /* blue-50 */
+    tr.edge-low    { background: #f8fafc; }  /* slate-50 */
+  </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
-  <div class="max-w-6xl mx-auto p-4 space-y-3">
+  <div class="max-w-7xl mx-auto p-4 space-y-4">
+
+    <!-- Top banner ad (replace when AdSense approved) -->
+    <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-20">
+      <div class="text-center text-slate-500 text-xs">
+        <div class="uppercase tracking-wide">Ad Space</div>
+        <div>728×90 / 970×90</div>
+      </div>
+    </div>
+
     <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v5.2.4</h1>
+      <h1 class="text-2xl font-bold">Today’s Matches — AI Picks</h1>
       <div class="space-x-3 text-xs">
         <a href="/diag" class="underline opacity-70 hover:opacity-100">Diag</a>
         <a href="/explain" class="underline opacity-70 hover:opacity-100">Explain</a>
       </div>
     </header>
-    <div class="overflow-x-auto bg-white rounded-2xl shadow">
-      <table class="min-w-full text-sm" id="tbl">
-        <thead class="bg-slate-100 sticky"><tr>
-          <th class="text-left p-3">Kickoff</th>
-          <th class="text-left p-3">League</th>
-          <th class="text-left p-3">Home</th>
-          <th class="text-left p-3">Away</th>
-          <th class="text-left p-3">Prediction</th>
-        </tr></thead>
-        <tbody id="rows"></tbody>
-      </table>
+
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+
+      <!-- Left ad card -->
+      <aside class="lg:col-span-2 space-y-4">
+        <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-40">
+          <div class="text-center text-slate-500 text-xs">
+            <div class="uppercase tracking-wide">Ad Space</div>
+            <div>300×250 / 160×600</div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main table -->
+      <main class="lg:col-span-8">
+        <div class="overflow-x-auto bg-white rounded-2xl shadow">
+          <table class="min-w-full text-sm" id="tbl">
+            <thead class="bg-slate-100 sticky">
+              <tr>
+                <th class="text-left p-3">Kickoff</th>
+                <th class="text-left p-3">League</th>
+                <th class="text-left p-3">Home</th>
+                <th class="text-left p-3">Away</th>
+                <th class="text-left p-3">Prediction</th>
+                <th class="text-left p-3">Alt pick</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+
+        <!-- Inline rectangle ad -->
+        <div class="mt-4 bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-24">
+          <div class="text-center text-slate-500 text-xs">
+            <div class="uppercase tracking-wide">Ad Space</div>
+            <div>468×60 / 320×100</div>
+          </div>
+        </div>
+
+        <div class="mt-3 text-[12px] text-slate-600">
+          <span class="inline-flex items-center mr-3">
+            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#ecfdf5"></span>
+            Strong signal (edge ≥ 10)
+          </span>
+          <span class="inline-flex items-center mr-3">
+            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#eff6ff"></span>
+            Medium signal (5–9)
+          </span>
+          <span class="inline-flex items-center">
+            <span class="inline-block w-4 h-4 rounded mr-1" style="background:#f8fafc"></span>
+            Low signal (&lt; 5)
+          </span>
+          <div class="mt-2 opacity-70">
+            Informational only. Do your own research.
+          </div>
+        </div>
+      </main>
+
+      <!-- Right ad card -->
+      <aside class="lg:col-span-2 space-y-4">
+        <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-40">
+          <div class="text-center text-slate-500 text-xs">
+            <div class="uppercase tracking-wide">Ad Space</div>
+            <div>300×250</div>
+          </div>
+        </div>
+      </aside>
     </div>
-    <p class="text-[12px] text-slate-500">Chooses the single strongest market by edge over neutral.</p>
   </div>
+
   <script>
+    function rowClass(edge){
+      if (edge >= 10) return 'edge-strong';
+      if (edge >= 5)  return 'edge-medium';
+      return 'edge-low';
+    }
+
     async function load(){
       const res = await fetch("/api/today");
       const data = await res.json();
       const rows = data.rows || [];
-      document.getElementById("rows").innerHTML = rows.map(r => (
-        "<tr class='border-b last:border-0'>" +
-          "<td class='p-3 whitespace-nowrap'>" + (r.kickoff||"") + "</td>" +
-          "<td class='p-3'>" + (r.league||"") + "</td>" +
-          "<td class='p-3 font-medium'>" + (r.home||"") + "</td>" +
-          "<td class='p-3'>" + (r.away||"") + "</td>" +
-          "<td class='p-3'>" + (r.prediction||"") + "</td>" +
-        "</tr>"
-      )).join("");
+      document.getElementById("rows").innerHTML = rows.map(r => {
+        const cls = rowClass(Number(r.primaryEdgePct||0));
+        return (
+          "<tr class='border-b last:border-0 " + cls + "'>" +
+            "<td class='p-3 whitespace-nowrap'>" + (r.kickoff||"") + "</td>" +
+            "<td class='p-3'>" + (r.league||"") + "</td>" +
+            "<td class='p-3 font-medium'>" + (r.home||"") + "</td>" +
+            "<td class='p-3'>" + (r.away||"") + "</td>" +
+            "<td class='p-3'>" + (r.prediction||"") + "</td>" +
+            "<td class='p-3 opacity-80'>" + (r.altPrediction||"") + "</td>" +
+          "</tr>"
+        );
+      }).join("");
     }
     load();
     setInterval(load, 5*60*1000);
