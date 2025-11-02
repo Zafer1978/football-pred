@@ -1,6 +1,6 @@
-// server.js — AI Picks v5.2.2 (Strongest-Market Selection) — FIXED H duplicate
-// One HTTP header helper (H) + one getJson().
-// Compares 1X2 vs O/U 2.5 vs BTTS and outputs the market with largest EDGE.
+// server.js — AI Picks v5.2.4
+// Fix diag bug: malformed dateTo in /matches URL. Now we compute dateFrom/dateTo
+// using LOCAL (Europe/Istanbul) calendar boundaries reliably (no ISO split glitches).
 
 import express from 'express';
 import dotenv from 'dotenv';
@@ -18,9 +18,9 @@ const END_HOUR = 24;
 const FALLBACK_DEMO = process.env.FALLBACK_DEMO === '1';
 
 // Calibration & selection
-const SHARPEN_TAU_1X2 = parseFloat(process.env.SHARPEN_TAU_1X2 || '1.25'); // sharpen 1X2
-const STRONG_DIFF_TILT = parseFloat(process.env.STRONG_DIFF_TILT || '220'); // Elo mismatch
-const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08'); // 8% min edge to accept strongest
+const SHARPEN_TAU_1X2 = parseFloat(process.env.SHARPEN_TAU_1X2 || '1.25');
+const STRONG_DIFF_TILT = parseFloat(process.env.STRONG_DIFF_TILT || '220');
+const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -32,6 +32,17 @@ function fmtYMD(d, tz = TZ) {
   return f.format(d);
 }
 function todayYMD(tz = TZ) { return fmtYMD(new Date(), tz); }
+function addDaysLocalYMD(days=0, tz = TZ){
+  const now = new Date();
+  const base = new Date(now.getTime() + days*24*3600*1000);
+  return fmtYMD(base, tz); // YYYY-MM-DD in tz
+}
+function localStartEndISODate(tz = TZ){
+  // Return [dateFrom, dateToExclusive] as YYYY-MM-DD (LOCAL calendar), safe for Football-Data params
+  const from = addDaysLocalYMD(0, tz);
+  const to = addDaysLocalYMD(1, tz);
+  return [from, to];
+}
 function localParts(iso, tz = TZ) {
   const dt = new Date(iso);
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -96,8 +107,11 @@ function leagueBaseGpm(league=''){
 const H = { 'X-Auth-Token': API_KEY, 'accept': 'application/json' };
 async function getJson(url){
   const res = await fetch(url, { headers: H });
+  const status = res.status;
   const txt = await res.text();
-  try { return JSON.parse(txt); } catch { return { raw: txt }; }
+  let json;
+  try { json = JSON.parse(txt); } catch { json = { raw: txt }; }
+  return { status, json, txt };
 }
 
 // ---------- Standings & form
@@ -105,8 +119,8 @@ const standingsCache = new Map();
 async function getStandings(compId){
   if (standingsCache.has(compId)) return standingsCache.get(compId);
   try {
-    const j = await getJson(`https://api.football-data.org/v4/competitions/${compId}/standings`);
-    const total = (j?.standings||[]).find(s => s.type === 'TOTAL');
+    const { json } = await getJson(`https://api.football-data.org/v4/competitions/${compId}/standings`);
+    const total = (json?.standings||[]).find(s => s.type === 'TOTAL');
     const table = total?.table || [];
     const map = new Map();
     for (const row of table) if (row.team?.id) map.set(row.team.id, row.position || 0);
@@ -124,9 +138,8 @@ async function getLastLeagueMatches(teamId, compId){
   const start = new Date(end.getTime() - 60*24*3600*1000);
   const dateFrom = start.toISOString().slice(0,10);
   const dateTo = end.toISOString().slice(0,10);
-  const url = `https://api.football-data.org/v4/teams/${teamId}/matches?status=FINISHED&dateFrom=${dateFrom}&dateTo=${dateTo}`;
-  const j = await getJson(url);
-  let arr = Array.isArray(j?.matches) ? j.matches : [];
+  const { json } = await getJson(`https://api.football-data.org/v4/teams/${teamId}/matches?status=FINISHED&dateFrom=${dateFrom}&dateTo=${dateTo}`);
+  let arr = Array.isArray(json?.matches) ? json.matches : [];
   arr = arr.filter(m => m.competition?.id === compId);
   arr.sort((a,b)=> (b.utcDate||'').localeCompare(a.utcDate||''));
   const last5 = arr.slice(0,5);
@@ -209,7 +222,6 @@ function expectedGoalsAdvanced(homeName, awayName, leagueName, homeForm, awayFor
   return { lh, la, seedDiff, homeFormFac:+homeFormFac.toFixed(3), awayFormFac:+awayFormFac.toFixed(3) };
 }
 
-// ---------- Select strongest market by EDGE over neutral baseline
 function chooseStrongest(lh, la){
   let { pH, pD, pA } = probs1X2(lh, la);
   ({ pH, pD, pA } = sharpen3(pH, pD, pA, SHARPEN_TAU_1X2));
@@ -242,13 +254,12 @@ function chooseStrongest(lh, la){
 async function fetchFixturesToday(withExplain=false){
   const date = todayYMD();
   if (!API_KEY) return { date, rows: [], reason: 'missing_api_key' };
-  const now = new Date();
-  const startUtc = now.toISOString().split('T')[0];
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
-  const endUtc = end.toISOString().split(0,10);
-  const url = `https://api.football-data.org/v4/matches?dateFrom=${startUtc}&dateTo=${endUtc}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
-  const j = await getJson(url);
-  const arr = Array.isArray(j?.matches) ? j.matches : [];
+
+  // Use LOCAL calendar window [today, tomorrow) in Istanbul
+  const [dateFrom, dateTo] = localStartEndISODate(TZ);
+  const url = `https://api.football-data.org/v4/matches?dateFrom=${dateFrom}&dateTo=${dateTo}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
+  const { status, json, txt } = await getJson(url);
+  const arr = Array.isArray(json?.matches) ? json.matches : [];
 
   const rows = [];
   for (const f of arr){
@@ -264,7 +275,6 @@ async function fetchFixturesToday(withExplain=false){
     const awayId = f.awayTeam?.id;
 
     let out = null;
-    let dbg = null;
     try {
       const standingsPack = compId ? await getStandings(compId) : { map:new Map(), size:20 };
       const homeMatches = homeId ? await getLastLeagueMatches(homeId, compId) : [];
@@ -273,16 +283,6 @@ async function fetchFixturesToday(withExplain=false){
       const awayForm = formStatsAdvanced(awayId, awayMatches, standingsPack);
       const eg = expectedGoalsAdvanced(homeName, awayName, league, homeForm, awayForm);
       out = chooseStrongest(eg.lh, eg.la);
-      if (withExplain) {
-        let { pH, pD, pA } = probs1X2(eg.lh, eg.la);
-        const raw = { pH, pD, pA };
-        const sharp = sharpen3(pH, pD, pA, SHARPEN_TAU_1X2);
-        const totLam = eg.lh + eg.la;
-        const pU25 = poisCdf(totLam, 2);
-        const pO25 = 1 - pU25;
-        const pBTTS = 1 - (Math.exp(-eg.lh) + Math.exp(-eg.la) - Math.exp(-eg.lh-eg.la));
-        dbg = { seeds:{home:seedOf(homeName),away:seedOf(awayName)}, form:{home:homeForm, away:awayForm}, eg, p1x2_raw:raw, p1x2_sharp:sharp, pO25, pU25, pBTTS, selection:out };
-      }
     } catch (e) {}
 
     const pct = Math.round((out?.prob || 0) * 100);
@@ -292,7 +292,6 @@ async function fetchFixturesToday(withExplain=false){
       hourLocal, home: homeName, away: awayName,
       prediction: out ? `${out.market}: ${out.label} (${pct}%, +${edgePct} edge)` : 'N/A'
     };
-    if (withExplain) row._explain = dbg;
     rows.push(row);
   }
 
@@ -303,14 +302,21 @@ async function fetchFixturesToday(withExplain=false){
       prediction: '1X2: 1 (64%, +31 edge)'
     });
   }
-  return { date, rows, totalFromApi: arr.length, apiUrl: url };
+  return { date, rows, totalFromApi: arr.length, apiUrl: url, status, bodyHead: String(txt).slice(0,300) };
 }
 
 // ---------- Cache & schedule
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
-  try { CACHE = { ...(await fetchFixturesToday()), savedAt: new Date().toISOString() }; }
-  catch (e) { CACHE = { date: todayYMD(), rows: [], savedAt: new Date().toISOString(), error: String(e.message || e) }; }
+  try { 
+    const fresh = await fetchFixturesToday(false);
+    CACHE = { ...fresh, savedAt: new Date().toISOString() };
+    console.log(`[warmCache] ${fresh.rows.length} rows; api status=${fresh.status}`);
+  }
+  catch (e) { 
+    CACHE = { date: todayYMD(), rows: [], savedAt: new Date().toISOString(), error: String(e.message || e) };
+    console.error('[warmCache] error', e);
+  }
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
@@ -322,7 +328,7 @@ app.get('/api/today', async (_req, res) => {
 });
 app.get('/diag', async (_req, res) => {
   const fresh = await fetchFixturesToday(false);
-  res.json({ tz: TZ, startHour: START_HOUR, url: fresh.apiUrl, totalFromApi: fresh.totalFromApi, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, savedAt: CACHE.savedAt });
+  res.json({ tz: TZ, startHour: START_HOUR, url: fresh.apiUrl, status: fresh.status, totalFromApi: fresh.totalFromApi, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, savedAt: CACHE.savedAt, bodyHead: fresh.bodyHead });
 });
 app.get('/explain', async (_req, res) => {
   const fresh = await fetchFixturesToday(true);
@@ -335,14 +341,14 @@ const INDEX_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today's Matches — AI Picks v5.2.2</title>
+  <title>Today's Matches — AI Picks v5.2.4</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>thead.sticky th{position:sticky;top:0;z-index:10} th,td{vertical-align:middle}</style>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-6xl mx-auto p-4 space-y-3">
     <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v5.2.2</h1>
+      <h1 class="text-2xl font-bold">Matches Today (11:00–24:00 TRT) — AI Picks v5.2.4</h1>
       <div class="space-x-3 text-xs">
         <a href="/diag" class="underline opacity-70 hover:opacity-100">Diag</a>
         <a href="/explain" class="underline opacity-70 hover:opacity-100">Explain</a>
