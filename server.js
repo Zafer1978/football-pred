@@ -1,4 +1,4 @@
-// server.js — AI Picks v5.2.5 (Alt pick + row colors + ad slots)
+// server.js — BetEstimate.com v5.2.6 (AI Picks + About/Privacy/Contact + Ad slots + Color-coded rows)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -313,7 +313,7 @@ async function fetchFixturesToday(withExplain=false){
       primaryEdgePct: 31, altEdgePct: 8
     });
   }
-  return { date, rows, totalFromApi: arr.length, apiUrl: url, status, bodyHead: String(txt).slice(0,300) };
+  return { date, rows, totalFromApi: arr.length, apiUrl: url, status: 200, bodyHead: String(txt).slice(0,300) };
 }
 
 // ---------- Cache & schedule
@@ -331,7 +331,49 @@ async function warmCache() {
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---------- Routes
+// ---------- Shared UI bits
+const HEAD_META = `
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="BetEstimate.com — free daily AI football predictions and statistical match analysis: 1X2, Over/Under 2.5, BTTS. Updated automatically." />
+  <meta name="keywords" content="AI football predictions, football betting tips, match probabilities, over under 2.5, BTTS, sports analytics, football data, daily picks, BetEstimate" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- AdSense global script goes here when approved:
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXX" crossorigin="anonymous"></script>
+  -->
+  <style>
+    thead.sticky th{position:sticky;top:0;z-index:10}
+    th,td{vertical-align:middle}
+    tr.edge-strong { background: #ecfdf5; }
+    tr.edge-medium { background: #eff6ff; }
+    tr.edge-low    { background: #f8fafc; }
+  </style>
+`;
+
+function siteHeader(active='home'){
+  const link = (href, label, key) => `<a class="px-2 py-1 rounded ${active===key?'bg-slate-900 text-white':'hover:underline'}" href="${href}">${label}</a>`;
+  return `
+    <header class="flex items-center justify-between">
+      <h1 class="text-2xl font-bold">BetEstimate.com — Today’s AI Football Picks</h1>
+      <nav class="text-sm space-x-2">
+        ${link('/', 'Home', 'home')}
+        ${link('/about', 'About', 'about')}
+        ${link('/privacy', 'Privacy', 'privacy')}
+        ${link('/contact', 'Contact', 'contact')}
+        <a href="/diag" class="opacity-70 hover:opacity-100">Diag</a>
+      </nav>
+    </header>
+  `;
+}
+
+const FOOTER = `
+  <footer class="mt-8 text-[12px] text-slate-600">
+    <div class="italic">Use the data at your own risk. Informational picks only — no guarantees.</div>
+    <div class="mt-2">© ${new Date().getFullYear()} BetEstimate.com</div>
+  </footer>
+`;
+
+// ---------- Routes: API
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -346,27 +388,18 @@ app.get('/explain', async (_req, res) => {
   res.json(fresh);
 });
 
-// ---------- UI (with ad slots + color-coded rows)
-const INDEX_HTML = `<!doctype html>
+// ---------- Pages
+app.get('/', (_req, res) => {
+  const INDEX_HTML = `<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Today’s Matches — AI Picks</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    thead.sticky th{position:sticky;top:0;z-index:10}
-    th,td{vertical-align:middle}
-    /* Row colors by primaryEdgePct */
-    tr.edge-strong { background: #ecfdf5; }  /* green-50 */
-    tr.edge-medium { background: #eff6ff; }  /* blue-50 */
-    tr.edge-low    { background: #f8fafc; }  /* slate-50 */
-  </style>
+  <title>BetEstimate.com — Today’s AI Football Picks</title>
+  ${HEAD_META}
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-7xl mx-auto p-4 space-y-4">
 
-    <!-- Top banner ad (replace when AdSense approved) -->
+    <!-- Top banner ad -->
     <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-20">
       <div class="text-center text-slate-500 text-xs">
         <div class="uppercase tracking-wide">Ad Space</div>
@@ -374,13 +407,7 @@ const INDEX_HTML = `<!doctype html>
       </div>
     </div>
 
-    <header class="flex items-center justify-between">
-      <h1 class="text-2xl font-bold">Today’s Matches — AI Picks</h1>
-      <div class="space-x-3 text-xs">
-        <a href="/diag" class="underline opacity-70 hover:opacity-100">Diag</a>
-        <a href="/explain" class="underline opacity-70 hover:opacity-100">Explain</a>
-      </div>
-    </header>
+    ${siteHeader('home')}
 
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
 
@@ -433,10 +460,9 @@ const INDEX_HTML = `<!doctype html>
             <span class="inline-block w-4 h-4 rounded mr-1" style="background:#f8fafc"></span>
             Low signal (&lt; 5)
           </span>
-          <div class="mt-2 opacity-70">
-            Informational only. Do your own research.
-          </div>
         </div>
+
+        ${FOOTER}
       </main>
 
       <!-- Right ad card -->
@@ -457,7 +483,6 @@ const INDEX_HTML = `<!doctype html>
       if (edge >= 5)  return 'edge-medium';
       return 'edge-low';
     }
-
     async function load(){
       const res = await fetch("/api/today");
       const data = await res.json();
@@ -481,12 +506,82 @@ const INDEX_HTML = `<!doctype html>
   </script>
 </body>
 </html>`;
-
-app.get('/', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(INDEX_HTML);
 });
 
+app.get('/about', (_req, res) => {
+  const HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <title>About — BetEstimate.com</title>
+  ${HEAD_META}
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-4xl mx-auto p-4 space-y-4">
+    ${siteHeader('about')}
+    <main class="bg-white rounded-2xl shadow p-6 space-y-3 text-sm leading-6">
+      <h2 class="text-xl font-semibold">About BetEstimate.com</h2>
+      <p><strong>BetEstimate</strong> provides <em>AI football predictions</em> powered by statistical models and historical data. We combine <em>Poisson goal models</em>, <em>Elo-like team strength</em>, <em>recent form</em>, opponent strength, venue adjustment, and league scoring baselines to estimate probabilities for <strong>1X2</strong>, <strong>Over/Under 2.5 goals</strong>, and <strong>Both Teams To Score</strong>.</p>
+      <p>Our goal is to help fans and analysts explore <em>match probabilities</em> and <em>sports analytics</em> signals. The picks are generated automatically and refreshed daily. Popular topics: AI football predictions, betting insights, football data, match probabilities, sports analytics, daily football picks, BTTS, over/under goals.</p>
+      <p><em>Important:</em> Predictions are informational only and not guarantees of any outcome. Use the data at your own risk.</p>
+    </main>
+    ${FOOTER}
+  </div>
+</body>
+</html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(HTML);
+});
+
+app.get('/privacy', (_req, res) => {
+  const HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <title>Privacy — BetEstimate.com</title>
+  ${HEAD_META}
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-4xl mx-auto p-4 space-y-4">
+    ${siteHeader('privacy')}
+    <main class="bg-white rounded-2xl shadow p-6 space-y-3 text-sm leading-6">
+      <h2 class="text-xl font-semibold">Privacy Policy</h2>
+      <p>We respect your privacy. BetEstimate.com may use cookies and basic web analytics to measure traffic and improve the site. If we enable Google AdSense or similar ad networks, those services may set cookies and use anonymous identifiers as described in their own policies.</p>
+      <p>We do not collect personal information unless you choose to contact us. If you email us, your address and message will be used only to reply and will not be sold to third parties.</p>
+      <p>By using this website, you consent to this policy. For questions, email <a class="underline" href="mailto:contact@betestimate.com">contact@betestimate.com</a>.</p>
+    </main>
+    ${FOOTER}
+  </div>
+</body>
+</html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(HTML);
+});
+
+app.get('/contact', (_req, res) => {
+  const HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <title>Contact — BetEstimate.com</title>
+  ${HEAD_META}
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-4xl mx-auto p-4 space-y-4">
+    ${siteHeader('contact')}
+    <main class="bg-white rounded-2xl shadow p-6 space-y-3 text-sm leading-6">
+      <h2 class="text-xl font-semibold">Contact</h2>
+      <p>Have a question or feedback? Email us at <a class="underline" href="mailto:contact@betestimate.com">contact@betestimate.com</a>.</p>
+      <p>We usually respond within a few days.</p>
+    </main>
+    ${FOOTER}
+  </div>
+</body>
+</html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(HTML);
+});
+
+// ---------- Start
 app.listen(PORT, HOST, () => {
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   warmCache();
