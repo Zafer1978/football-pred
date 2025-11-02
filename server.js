@@ -1,4 +1,4 @@
-// server.js — BetEstimate.com v5.2.7 (Sport Energy Theme)
+// server.js — BetEstimate.com v5.2.8 (Sport Energy Theme, Diag hidden, /explain removed)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -372,7 +372,7 @@ function siteHeader(active='home'){
         ${link('/about', 'About', 'about')}
         ${link('/privacy', 'Privacy', 'privacy')}
         ${link('/contact', 'Contact', 'contact')}
-        <a href="/diag" class="px-3 py-1.5 rounded bg-white/10 hover:bg-white/15">Diag</a>
+        <!-- Diag intentionally hidden from nav -->
       </nav>
     </header>
   `;
@@ -394,10 +394,6 @@ app.get('/api/today', async (_req, res) => {
 app.get('/diag', async (_req, res) => {
   const fresh = await fetchFixturesToday(false);
   res.json({ tz: TZ, startHour: START_HOUR, url: fresh.apiUrl, status: fresh.status, totalFromApi: fresh.totalFromApi, cacheRows: CACHE.rows?.length || 0, cacheDate: CACHE.date, savedAt: CACHE.savedAt, bodyHead: fresh.bodyHead });
-});
-app.get('/explain', async (_req, res) => {
-  const fresh = await fetchFixturesToday(true);
-  res.json(fresh);
 });
 
 // ---------- Pages
