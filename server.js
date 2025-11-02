@@ -334,6 +334,7 @@ cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ })
 // ---------- Shared UI bits (Sport Energy Theme)
 const HEAD_META = `
   <meta charset="utf-8" />
+  <meta name="google-adsense-account" content="ca-pub-4391382697370741">
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="BetEstimate.com — free daily AI football predictions and statistical match analysis: 1X2, Over/Under 2.5, BTTS. Updated automatically." />
   <meta name="keywords" content="AI football predictions, football betting tips, match probabilities, over under 2.5, BTTS, sports analytics, football data, daily picks, BetEstimate" />
