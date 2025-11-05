@@ -374,8 +374,7 @@ function siteHeader(active='home'){
         ${link('/about', 'About', 'about')}
         ${link('/privacy', 'Privacy', 'privacy')}
         ${link('/contact', 'Contact', 'contact')}
-        <!-- Diag intentionally hidden from nav -->
-      </nav>
+        </nav>
     </header>
   `;
 }
@@ -409,7 +408,6 @@ app.get('/', (_req, res) => {
 <body class="text-slate-900">
   <div class="max-w-7xl mx-auto p-4 space-y-4">
 
-    <!-- Top banner ad -->
     <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-20">
       <div class="text-center text-slate-600 text-xs">
         <div class="uppercase tracking-wide">Ad Space</div>
@@ -421,7 +419,6 @@ app.get('/', (_req, res) => {
 
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
 
-      <!-- Left ad card -->
       <aside class="lg:col-span-2 space-y-4">
         <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-40">
           <div class="text-center text-slate-600 text-xs">
@@ -431,7 +428,6 @@ app.get('/', (_req, res) => {
         </div>
       </aside>
 
-      <!-- Main table -->
       <main class="lg:col-span-8">
         <div class="overflow-x-auto bg-white rounded-2xl shadow">
           <table class="min-w-full text-sm" id="tbl">
@@ -449,7 +445,6 @@ app.get('/', (_req, res) => {
           </table>
         </div>
 
-        <!-- Inline rectangle ad -->
         <div class="mt-4 bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-24">
           <div class="text-center text-slate-600 text-xs">
             <div class="uppercase tracking-wide">Ad Space</div>
@@ -468,14 +463,13 @@ app.get('/', (_req, res) => {
           </span>
           <span class="inline-flex items-center">
             <span class="inline-block w-4 h-4 rounded mr-1" style="background:#f8fafc"></span>
-            Low signal (&lt; 5)
+            Low signal (< 5)
           </span>
         </div>
 
         ${FOOTER}
       </main>
 
-      <!-- Right ad card -->
       <aside class="lg:col-span-2 space-y-4">
         <div class="bg-white rounded-2xl shadow p-4 flex items-center justify-center min-h-40">
           <div class="text-center text-slate-600 text-xs">
@@ -591,23 +585,19 @@ app.get('/contact', (_req, res) => {
   res.send(HTML);
 });
 
-// ---------- Start
-
 // ---------- SEO: robots.txt
 app.get('/robots.txt', (req, res) => {
   const host = `https://${req.headers.host || 'www.betestimate.com'}`;
-  res.type('text/plain').send(
-`User-agent: *
+  res.type('text/plain').send(`User-agent: *
 Allow: /
 Disallow: /diag
 Sitemap: ${host}/sitemap.xml
 `);
 });
 
-
 // ---------- SEO: sitemap.xml
-app.get('/sitemap.xml', (_req, res) => {
-  const host = `https://${_req.headers.host || 'www.betestimate.com'}`;
+app.get('/sitemap.xml', (req, res) => {
+  const host = `https://${req.headers.host || 'www.betestimate.com'}`;
   const mk = (path, priority = '0.6', changefreq = 'daily') => {
     const loc = path ? `${host}/${path}` : `${host}/`;
     return `<url><loc>${loc}</loc><changefreq>${changefreq}</changefreq><priority>${priority}</priority></url>`;
@@ -618,14 +608,13 @@ app.get('/sitemap.xml', (_req, res) => {
     mk('privacy'),
     mk('contact'),
   ].join('');
-  const xml =
-`<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls}
+  const xml =`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}
 </urlset>`;
   res.type('application/xml').send(xml);
 });
 
+// ---------- Start
 app.listen(PORT, HOST, () => {
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   warmCache();
