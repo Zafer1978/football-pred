@@ -6,10 +6,6 @@ import cron from 'node-cron';
 dotenv.config();
 
 const app = express();
-
-// Base URL for SEO assets
-const BASE_URL = process.env.BASE_URL || 'https://www.betestimate.com';
-
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = '0.0.0.0';
 const TZ = process.env.TZ || 'Europe/Istanbul';
@@ -339,7 +335,6 @@ cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ })
 const HEAD_META = `
   <meta charset="utf-8" />
   <meta name="google-adsense-account" content="ca-pub-4391382697370741">
-  <meta name="google-site-verification" content="Vh8nIeaILeA83-whwJyMp8mIkeCq3kRaHfGdXMbHgK0" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="BetEstimate.com — free daily AI football predictions and statistical match analysis: 1X2, Over/Under 2.5, BTTS. Updated automatically." />
   <meta name="keywords" content="AI football predictions, football betting tips, match probabilities, over under 2.5, BTTS, sports analytics, football data, daily picks, BetEstimate" />
@@ -596,40 +591,6 @@ app.get('/contact', (_req, res) => {
 });
 
 // ---------- Start
-
-// ---------- SEO: robots.txt
-app.get('/robots.txt', (req, res) => {
-  const host = process.env.BASE_URL || `https://${req.headers.host || 'www.betestimate.com'}`;
-  res.type('text/plain').send(
-`User-agent: *
-Allow: /
-Disallow: /diag
-Sitemap: ${host}/sitemap.xml
-`);
-});
-
-
-// ---------- SEO: sitemap.xml
-app.get('/sitemap.xml', (_req, res) => {
-  const host = process.env.BASE_URL || 'https://www.betestimate.com';
-  const mk = (path, priority = '0.6', changefreq = 'daily') => {
-    const loc = path ? `${host}/${path}` : `${host}/`;
-    return `<url><loc>${loc}</loc><changefreq>${changefreq}</changefreq><priority>${priority}</priority></url>`;
-  };
-  const urls = [
-    mk('', '1.0'),     // Home
-    mk('about'),
-    mk('privacy'),
-    mk('contact'),
-  ].join('');
-  const xml =
-`<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls}
-</urlset>`;
-  res.type('application/xml').send(xml);
-});
-
 app.listen(PORT, HOST, () => {
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   warmCache();
